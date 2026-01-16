@@ -304,7 +304,7 @@ where
                                 let tool_span = tracing::Span::current();
                                 let tool_args = json_utils::value_to_json_string(&tool_call.function.arguments);
                                 if let Some(ref hook) = self.hook {
-                                    hook.on_tool_call(&tool_call.function.name, tool_call.call_id.clone(), &tool_args, cancel_sig.clone()).await;
+                                    hook.on_tool_call(&tool_call.function.name, Some(tool_call.id.clone()), &tool_args, cancel_sig.clone()).await;
                                     if cancel_sig.is_cancelled() {
                                         return Err(StreamingError::Prompt(PromptError::prompt_cancelled(chat_history.read().await.to_vec(),
                                             cancel_sig.cancel_reason().unwrap_or("<no reason given>"),
@@ -327,7 +327,7 @@ where
                                 tool_span.record("gen_ai.tool.call.result", &tool_result);
 
                                 if let Some(ref hook) = self.hook {
-                                    hook.on_tool_result(&tool_call.function.name, tool_call.call_id.clone(), &tool_args, &tool_result.to_string(), cancel_sig.clone())
+                                    hook.on_tool_result(&tool_call.function.name, Some(tool_call.id.clone()), &tool_args, &tool_result.to_string(), cancel_sig.clone())
                                     .await;
 
                                     if cancel_sig.is_cancelled() {
