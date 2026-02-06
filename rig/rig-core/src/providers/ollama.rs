@@ -266,7 +266,9 @@ pub const MISTRAL: &str = "mistral";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompletionResponse {
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub created_at: String,
     pub message: Message,
     pub done: bool,
@@ -302,10 +304,11 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     assistant_contents.push(completion::AssistantContent::text(&content));
                 }
                 // Process tool_calls following Ollama's chat response definition.
-                // Each ToolCall has an id, a type, and a function field.
+                // Ollama doesn't provide tool_call_id, generate a synthetic one.
                 for tc in tool_calls.iter() {
+                    let synthetic_id = format!("call_{:016x}", fastrand::u64(..));
                     assistant_contents.push(completion::AssistantContent::tool_call(
-                        tc.function.name.clone(),
+                        &synthetic_id,
                         tc.function.name.clone(),
                         tc.function.arguments.clone(),
                     ));
@@ -675,8 +678,10 @@ where
 
                         for tool_call in tool_calls {
                             tool_calls_final.push(tool_call.clone());
+                            // Ollama doesn't provide tool_call_id, generate a synthetic one
+                            let synthetic_id = format!("call_{:016x}", fastrand::u64(..));
                             yield RawStreamingChoice::ToolCall(
-                                crate::streaming::RawStreamingToolCall::new(String::new(), tool_call.function.name, tool_call.function.arguments)
+                                crate::streaming::RawStreamingToolCall::new(synthetic_id, tool_call.function.name, tool_call.function.arguments)
                             );
                         }
                     }
