@@ -217,6 +217,13 @@ where
 
                 current_max_depth += 1;
 
+                let turn_span = info_span!(
+                    parent: tracing::Span::current(),
+                    "agent.turn",
+                    gen_ai.agent.turn = current_max_depth,
+                    gen_ai.agent.max_turns = self.max_depth,
+                );
+
                 if self.max_depth > 1 {
                     tracing::info!(
                         "Current conversation depth: {}/{}",
@@ -239,7 +246,7 @@ where
 
                 let chat_stream_span = info_span!(
                     target: "rig::agent_chat",
-                    parent: tracing::Span::current(),
+                    parent: &turn_span,
                     "chat_streaming",
                     gen_ai.operation.name = "chat",
                     gen_ai.system_instructions = &agent.preamble,
@@ -288,7 +295,7 @@ where
                         },
                         Ok(StreamedAssistantContent::ToolCall(tool_call)) => {
                             let tool_span = info_span!(
-                                parent: tracing::Span::current(),
+                                parent: &turn_span,
                                 "execute_tool",
                                 gen_ai.operation.name = "execute_tool",
                                 gen_ai.tool.type = "function",
