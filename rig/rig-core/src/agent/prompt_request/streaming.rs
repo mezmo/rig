@@ -217,11 +217,20 @@ where
 
                 current_max_depth += 1;
 
+                let turn_prompt_text = serde_json::to_string(&current_prompt).unwrap_or_default();
+                let turn_history_len = chat_history.read().await.len();
+
                 let turn_span = info_span!(
                     parent: tracing::Span::current(),
                     "agent.turn",
                     gen_ai.agent.turn = current_max_depth,
                     gen_ai.agent.max_turns = self.max_depth,
+                    gen_ai.agent.name = agent.name(),
+                    gen_ai.turn.prompt = %turn_prompt_text,
+                    gen_ai.turn.history_len = turn_history_len,
+                    gen_ai.turn.tool_count = tracing::field::Empty,
+                    gen_ai.turn.has_tool_calls = tracing::field::Empty,
+                    gen_ai.turn.response = tracing::field::Empty,
                 );
 
                 if self.max_depth > 1 {
@@ -410,6 +419,13 @@ where
                             break 'outer;
                         }
                     }
+                }
+
+                // Record turn-level enrichments
+                turn_span.record("gen_ai.turn.tool_count", tool_calls.len());
+                turn_span.record("gen_ai.turn.has_tool_calls", did_call_tool);
+                if !last_text_response.is_empty() {
+                    turn_span.record("gen_ai.turn.response", &last_text_response);
                 }
 
                 // Add (parallel) tool calls to chat history
