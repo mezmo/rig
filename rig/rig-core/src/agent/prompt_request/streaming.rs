@@ -436,24 +436,31 @@ where
                     });
                 }
 
-                // Add tool results to chat history
-                for (id, call_id, tool_result) in tool_results {
-                    if let Some(call_id) = call_id {
-                        chat_history.write().await.push(Message::User {
-                            content: OneOrMany::one(UserContent::tool_result_with_call_id(
+                // Aggregate all tool results into a single Message::User
+                // (matches the non-streaming implementation in mod.rs)
+                let tool_content: Vec<UserContent> = tool_results
+                    .into_iter()
+                    .map(|(id, call_id, tool_result)| {
+                        if let Some(call_id) = call_id {
+                            UserContent::tool_result_with_call_id(
                                 &id,
                                 call_id.clone(),
                                 OneOrMany::one(ToolResultContent::text(&tool_result)),
-                            )),
-                        });
-                    } else {
-                        chat_history.write().await.push(Message::User {
-                            content: OneOrMany::one(UserContent::tool_result(
+                            )
+                        } else {
+                            UserContent::tool_result(
                                 &id,
                                 OneOrMany::one(ToolResultContent::text(&tool_result)),
-                            )),
-                        });
-                    }
+                            )
+                        }
+                    })
+                    .collect();
+
+                if !tool_content.is_empty() {
+                    chat_history.write().await.push(Message::User {
+                        content: OneOrMany::many(tool_content)
+                            .expect("There is at least one tool result"),
+                    });
                 }
 
                 // Set the current prompt to the last message in the chat history
