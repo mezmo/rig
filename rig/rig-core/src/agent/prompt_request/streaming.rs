@@ -231,7 +231,9 @@ where
                     gen_ai.turn.tool_count = tracing::field::Empty,
                     gen_ai.turn.has_tool_calls = tracing::field::Empty,
                     gen_ai.turn.response = tracing::field::Empty,
+                    gen_ai.turn.reasoning = tracing::field::Empty,
                 );
+                let mut turn_reasoning = String::new();
 
                 if self.max_depth > 1 {
                     tracing::info!(
@@ -389,10 +391,12 @@ where
                             }
                         }
                         Ok(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })) => {
+                            turn_reasoning.push_str(&reasoning.join("\n"));
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
                             did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::ReasoningDelta { reasoning, id }) => {
+                            turn_reasoning.push_str(&reasoning);
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ReasoningDelta { reasoning, id }));
                             did_call_tool = false;
                         },
@@ -426,6 +430,9 @@ where
                 turn_span.record("gen_ai.turn.has_tool_calls", did_call_tool);
                 if !last_text_response.is_empty() {
                     turn_span.record("gen_ai.turn.response", &last_text_response);
+                }
+                if !turn_reasoning.is_empty() {
+                    turn_span.record("gen_ai.turn.reasoning", &turn_reasoning);
                 }
 
                 // Add (parallel) tool calls to chat history
