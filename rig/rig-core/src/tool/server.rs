@@ -1,5 +1,6 @@
 use futures::{StreamExt, TryStreamExt, channel::oneshot::Canceled, stream};
 use tokio::sync::mpsc::{Sender, error::SendError};
+use tracing::Instrument;
 
 use crate::{
     completion::{CompletionError, ToolDefinition},
@@ -132,8 +133,8 @@ impl ToolServer {
                     .send(ToolServerResponse::ToolDeleted)
                     .unwrap();
             }
-            ToolServerRequestMessageKind::CallTool { name, args } => {
-                match self.toolset.call(&name, args.clone()).await {
+            ToolServerRequestMessageKind::CallTool { name, args, caller_span } => {
+                match self.toolset.call(&name, args.clone()).instrument(caller_span).await {
                     Ok(result) => {
                         let _ = callback_channel.send(ToolServerResponse::ToolExecuted { result });
                     }
@@ -278,6 +279,7 @@ impl ToolServerHandle {
                 data: ToolServerRequestMessageKind::CallTool {
                     name: tool_name.to_string(),
                     args: args.to_string(),
+                    caller_span: tracing::Span::current(),
                 },
             })
             .await?;
@@ -325,7 +327,7 @@ pub enum ToolServerRequestMessageKind {
     AddTool(Box<dyn ToolDyn>),
     AppendToolset(ToolSet),
     RemoveTool { tool_name: String },
-    CallTool { name: String, args: String },
+    CallTool { name: String, args: String, caller_span: tracing::Span },
     GetToolDefs { prompt: Option<String> },
 }
 

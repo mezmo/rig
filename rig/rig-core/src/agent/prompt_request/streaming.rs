@@ -217,6 +217,24 @@ where
 
                 current_max_depth += 1;
 
+                let turn_prompt_text = serde_json::to_string(&current_prompt).unwrap_or_default();
+                let turn_history_len = chat_history.read().await.len();
+
+                let turn_span = info_span!(
+                    parent: tracing::Span::current(),
+                    "agent.turn",
+                    gen_ai.agent.turn = current_max_depth,
+                    gen_ai.agent.max_turns = self.max_depth,
+                    gen_ai.agent.name = agent.name(),
+                    gen_ai.turn.prompt = %turn_prompt_text,
+                    gen_ai.turn.history_len = turn_history_len,
+                    gen_ai.turn.tool_count = tracing::field::Empty,
+                    gen_ai.turn.has_tool_calls = tracing::field::Empty,
+                    gen_ai.turn.response = tracing::field::Empty,
+                    gen_ai.turn.reasoning = tracing::field::Empty,
+                );
+                let mut turn_reasoning = String::new();
+
                 if self.max_depth > 1 {
                     tracing::info!(
                         "Current conversation depth: {}/{}",
@@ -239,7 +257,7 @@ where
 
                 let chat_stream_span = info_span!(
                     target: "rig::agent_chat",
-                    parent: tracing::Span::current(),
+                    parent: &turn_span,
                     "chat_streaming",
                     gen_ai.operation.name = "chat",
                     gen_ai.system_instructions = &agent.preamble,
@@ -288,7 +306,7 @@ where
                         },
                         Ok(StreamedAssistantContent::ToolCall(tool_call)) => {
                             let tool_span = info_span!(
-                                parent: tracing::Span::current(),
+                                parent: &turn_span,
                                 "execute_tool",
                                 gen_ai.operation.name = "execute_tool",
                                 gen_ai.tool.type = "function",
@@ -373,10 +391,12 @@ where
                             }
                         }
                         Ok(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })) => {
+                            turn_reasoning.push_str(&reasoning.join("\n"));
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
                             did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::ReasoningDelta { reasoning, id }) => {
+                            turn_reasoning.push_str(&reasoning);
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ReasoningDelta { reasoning, id }));
                             did_call_tool = false;
                         },
@@ -405,6 +425,16 @@ where
                     }
                 }
 
+                // Record turn-level enrichments
+                turn_span.record("gen_ai.turn.tool_count", tool_calls.len());
+                turn_span.record("gen_ai.turn.has_tool_calls", did_call_tool);
+                if !last_text_response.is_empty() {
+                    turn_span.record("gen_ai.turn.response", &last_text_response);
+                }
+                if !turn_reasoning.is_empty() {
+                    turn_span.record("gen_ai.turn.reasoning", &turn_reasoning);
+                }
+
                 // Add (parallel) tool calls to chat history
                 if !tool_calls.is_empty() {
                     chat_history.write().await.push(Message::Assistant {
@@ -413,24 +443,31 @@ where
                     });
                 }
 
-                // Add tool results to chat history
-                for (id, call_id, tool_result) in tool_results {
-                    if let Some(call_id) = call_id {
-                        chat_history.write().await.push(Message::User {
-                            content: OneOrMany::one(UserContent::tool_result_with_call_id(
+                // Aggregate all tool results into a single Message::User
+                // (matches the non-streaming implementation in mod.rs)
+                let tool_content: Vec<UserContent> = tool_results
+                    .into_iter()
+                    .map(|(id, call_id, tool_result)| {
+                        if let Some(call_id) = call_id {
+                            UserContent::tool_result_with_call_id(
                                 &id,
                                 call_id.clone(),
                                 OneOrMany::one(ToolResultContent::text(&tool_result)),
-                            )),
-                        });
-                    } else {
-                        chat_history.write().await.push(Message::User {
-                            content: OneOrMany::one(UserContent::tool_result(
+                            )
+                        } else {
+                            UserContent::tool_result(
                                 &id,
                                 OneOrMany::one(ToolResultContent::text(&tool_result)),
-                            )),
-                        });
-                    }
+                            )
+                        }
+                    })
+                    .collect();
+
+                if !tool_content.is_empty() {
+                    chat_history.write().await.push(Message::User {
+                        content: OneOrMany::many(tool_content)
+                            .expect("There is at least one tool result"),
+                    });
                 }
 
                 // Set the current prompt to the last message in the chat history
