@@ -347,6 +347,10 @@ where
         let mut current_max_depth = 0;
         let mut usage = Usage::new();
         let current_span_id: AtomicU64 = AtomicU64::new(0);
+        // Accumulate text from ALL turns, not just the final one.
+        // Some models (e.g. Qwen3) emit substantive text alongside tool calls
+        // but produce minimal text on the final (no-tool-call) turn.
+        let mut accumulated_texts: Vec<String> = Vec::new();
 
         // We need to do at least 2 loops for 1 roundtrip (user expects normal message)
         let last_prompt = loop {
@@ -439,23 +443,35 @@ where
                 .iter()
                 .partition(|choice| matches!(choice, AssistantContent::ToolCall(_)));
 
+            // Collect text from this turn (regardless of whether tool calls are present)
+            let turn_texts: String = texts
+                .iter()
+                .filter_map(|content| {
+                    if let AssistantContent::Text(text) = content {
+                        let trimmed = text.text.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if !turn_texts.is_empty() {
+                accumulated_texts.push(turn_texts);
+            }
+
             chat_history.push(Message::Assistant {
                 id: None,
                 content: resp.choice.clone(),
             });
 
             if tool_calls.is_empty() {
-                let merged_texts = texts
-                    .into_iter()
-                    .filter_map(|content| {
-                        if let AssistantContent::Text(text) = content {
-                            Some(text.text.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let merged_texts = accumulated_texts.join("\n\n");
 
                 if self.max_depth > 1 {
                     tracing::info!("Depth reached: {}/{}", current_max_depth, self.max_depth);
@@ -465,7 +481,7 @@ where
                 agent_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
                 agent_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
 
-                // If there are no tool calls, depth is not relevant, we can just return the merged text response.
+                // Return accumulated text from all turns in the multi-turn conversation.
                 return Ok(PromptResponse::new(merged_texts, usage));
             }
 

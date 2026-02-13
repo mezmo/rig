@@ -193,6 +193,10 @@ where
         let mut last_text_response = String::new();
         let mut is_text_response = false;
         let mut max_depth_reached = false;
+        // Accumulate text from ALL turns, not just the final one.
+        // Some models (e.g. Qwen3) emit substantive text alongside tool calls
+        // but produce minimal text on the final (no-tool-call) turn.
+        let mut accumulated_texts: Vec<String> = Vec::new();
 
         let mut aggregated_usage = crate::completion::Usage::new();
 
@@ -439,12 +443,19 @@ where
                     None => unreachable!("Chat history should never be empty at this point"),
                 };
 
+                // Save this turn's text into the accumulator before moving to next turn
+                if !last_text_response.trim().is_empty() {
+                    accumulated_texts.push(last_text_response.trim().to_string());
+                }
+
                 if !did_call_tool {
                     let current_span = tracing::Span::current();
                     current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens);
                     current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens);
                     tracing::info!("Agent multi-turn stream finished");
-                    yield Ok(MultiTurnStreamItem::final_response(&last_text_response, aggregated_usage));
+                    // Use accumulated text from all turns for the final response
+                    let full_response = accumulated_texts.join("\n\n");
+                    yield Ok(MultiTurnStreamItem::final_response(&full_response, aggregated_usage));
                     break;
                 }
             }
