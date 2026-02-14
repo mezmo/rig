@@ -156,17 +156,24 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
-        let content = response
+        let content: Vec<_> = response
             .content
             .iter()
-            .map(|content| content.clone().try_into())
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|content| content.clone().try_into().ok())
+            .collect();
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
-            )
-        })?;
+        // Anthropic may return empty content (e.g. ack after tool_use with
+        // stop_reason=end_turn). Synthesize an empty text response so the
+        // multi-turn loop can exit gracefully instead of erroring.
+        let choice = if content.is_empty() {
+            OneOrMany::one(completion::AssistantContent::text(""))
+        } else {
+            OneOrMany::many(content).map_err(|_| {
+                CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                )
+            })?
+        };
 
         let usage = completion::Usage {
             input_tokens: response.usage.input_tokens,
