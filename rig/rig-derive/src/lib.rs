@@ -30,6 +30,8 @@ pub fn derive_provider_client(input: TokenStream) -> TokenStream {
 /// Usage can be found below:
 ///
 /// ```rust
+/// use rig::Embed;
+///
 /// #[derive(Embed)]
 /// struct Foo {
 ///     id: String,

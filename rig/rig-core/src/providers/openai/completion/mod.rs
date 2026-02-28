@@ -538,7 +538,9 @@ impl TryFrom<OneOrMany<message::AssistantContent>> for Vec<Message> {
                     message::AssistantContent::Text(text) => texts.push(text),
                     message::AssistantContent::ToolCall(tool_call) => tools.push(tool_call),
                     message::AssistantContent::Reasoning(_) => {
-                        panic!("The OpenAI Completions API doesn't support reasoning!");
+                        // Reasoning is streamed but not added to chat_history,
+                        // so this arm should never fire. Skip silently rather
+                        // than panicking to avoid a landmine for future changes.
                     }
                     message::AssistantContent::Image(_) => {
                         panic!(
