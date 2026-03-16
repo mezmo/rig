@@ -692,6 +692,7 @@ where
 
         let response_message = crate::providers::openai::completion::Message::Assistant {
             content: vec![AssistantContent::Text { text: text_response }],
+            reasoning_content: None,
             refusal: None,
             audio: None,
             name: None,

@@ -130,6 +130,8 @@ pub enum Message {
         #[serde(default, deserialize_with = "json_utils::string_or_vec")]
         content: Vec<AssistantContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         refusal: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         audio: Option<AudioAssistant>,
@@ -531,26 +533,32 @@ impl TryFrom<OneOrMany<message::AssistantContent>> for Vec<Message> {
     type Error = message::MessageError;
 
     fn try_from(value: OneOrMany<message::AssistantContent>) -> Result<Self, Self::Error> {
-        let (text_content, tool_calls) = value.into_iter().fold(
-            (Vec::new(), Vec::new()),
-            |(mut texts, mut tools), content| {
-                match content {
-                    message::AssistantContent::Text(text) => texts.push(text),
-                    message::AssistantContent::ToolCall(tool_call) => tools.push(tool_call),
-                    message::AssistantContent::Reasoning(_) => {
-                        // Reasoning is streamed but not added to chat_history,
-                        // so this arm should never fire. Skip silently rather
-                        // than panicking to avoid a landmine for future changes.
-                    }
-                    message::AssistantContent::Image(_) => {
-                        panic!(
-                            "The OpenAI Completions API doesn't support image content in assistant messages!"
-                        );
+        let mut text_content = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut reasoning_chunks = Vec::new();
+
+        for content in value.into_iter() {
+            match content {
+                message::AssistantContent::Text(text) => text_content.push(text),
+                message::AssistantContent::ToolCall(tool_call) => tool_calls.push(tool_call),
+                message::AssistantContent::Reasoning(reasoning) => {
+                    let joined = reasoning.reasoning.join("\n");
+                    if !joined.is_empty() {
+                        reasoning_chunks.push(joined);
                     }
                 }
-                (texts, tools)
-            },
-        );
+                message::AssistantContent::Image(_) => {
+                    // Images in assistant messages are not supported by the OpenAI
+                    // Completions API — silently skip.
+                }
+            }
+        }
+
+        let reasoning_content = if reasoning_chunks.is_empty() {
+            None
+        } else {
+            Some(reasoning_chunks.join("\n"))
+        };
 
         // `OneOrMany` ensures at least one `AssistantContent::Text` or `ToolCall` exists,
         //  so either `content` or `tool_calls` will have some content.
@@ -559,6 +567,7 @@ impl TryFrom<OneOrMany<message::AssistantContent>> for Vec<Message> {
                 .into_iter()
                 .map(|content| content.text.into())
                 .collect::<Vec<_>>(),
+            reasoning_content,
             refusal: None,
             audio: None,
             name: None,
@@ -619,23 +628,31 @@ impl TryFrom<Message> for message::Message {
             },
             Message::Assistant {
                 content,
+                reasoning_content,
                 tool_calls,
                 ..
             } => {
-                let mut content = content
-                    .into_iter()
-                    .map(|content| match content {
-                        AssistantContent::Text { text } => message::AssistantContent::text(text),
+                let mut assistant_content = Vec::new();
 
-                        // TODO: Currently, refusals are converted into text, but should be
-                        //  investigated for generalization.
-                        AssistantContent::Refusal { refusal } => {
-                            message::AssistantContent::text(refusal)
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                // Reasoning goes first (matches wire order: reasoning → text → tool_calls)
+                if let Some(reasoning) = reasoning_content
+                    && !reasoning.is_empty()
+                {
+                    assistant_content
+                        .push(message::AssistantContent::reasoning(&reasoning));
+                }
 
-                content.extend(
+                assistant_content.extend(content.into_iter().map(|c| match c {
+                    AssistantContent::Text { text } => message::AssistantContent::text(text),
+
+                    // TODO: Currently, refusals are converted into text, but should be
+                    //  investigated for generalization.
+                    AssistantContent::Refusal { refusal } => {
+                        message::AssistantContent::text(refusal)
+                    }
+                }));
+
+                assistant_content.extend(
                     tool_calls
                         .into_iter()
                         .map(|tool_call| Ok(message::AssistantContent::ToolCall(tool_call.into())))
@@ -644,7 +661,7 @@ impl TryFrom<Message> for message::Message {
 
                 message::Message::Assistant {
                     id: None,
-                    content: OneOrMany::many(content).map_err(|_| {
+                    content: OneOrMany::many(assistant_content).map_err(|_| {
                         message::MessageError::ConversionError(
                             "Neither `content` nor `tool_calls` was provided to the Message"
                                 .to_owned(),
@@ -759,25 +776,32 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
         let content = match &choice.message {
             Message::Assistant {
                 content,
+                reasoning_content,
                 tool_calls,
                 ..
             } => {
-                let mut content = content
-                    .iter()
-                    .filter_map(|c| {
-                        let s = match c {
-                            AssistantContent::Text { text } => text,
-                            AssistantContent::Refusal { refusal } => refusal,
-                        };
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(completion::AssistantContent::text(s))
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                let mut result = Vec::new();
 
-                content.extend(
+                // Include reasoning_content if present
+                if let Some(reasoning) = reasoning_content
+                    && !reasoning.is_empty()
+                {
+                    result.push(completion::AssistantContent::reasoning(reasoning));
+                }
+
+                result.extend(content.iter().filter_map(|c| {
+                    let s = match c {
+                        AssistantContent::Text { text } => text,
+                        AssistantContent::Refusal { refusal } => refusal,
+                    };
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(completion::AssistantContent::text(s))
+                    }
+                }));
+
+                result.extend(
                     tool_calls
                         .iter()
                         .map(|call| {
@@ -789,7 +813,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         })
                         .collect::<Vec<_>>(),
                 );
-                Ok(content)
+                Ok(result)
             }
             _ => Err(CompletionError::ResponseError(
                 "Response did not contain a valid message or tool call".into(),

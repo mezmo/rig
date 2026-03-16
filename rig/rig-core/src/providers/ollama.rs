@@ -915,13 +915,25 @@ impl From<Message> for crate::completion::Message {
             },
             Message::Assistant {
                 content,
+                thinking,
                 tool_calls,
                 ..
             } => {
-                let mut assistant_contents =
-                    vec![crate::completion::message::AssistantContent::Text(Text {
-                        text: content,
-                    })];
+                let mut assistant_contents = Vec::new();
+
+                // Map thinking field to Reasoning content
+                if let Some(thinking_text) = thinking
+                    && !thinking_text.is_empty()
+                {
+                    assistant_contents.push(
+                        crate::completion::message::AssistantContent::reasoning(&thinking_text),
+                    );
+                }
+
+                assistant_contents.push(
+                    crate::completion::message::AssistantContent::Text(Text { text: content }),
+                );
+
                 for tc in tool_calls {
                     assistant_contents.push(
                         crate::completion::message::AssistantContent::tool_call(
