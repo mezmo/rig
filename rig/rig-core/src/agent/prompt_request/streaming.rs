@@ -191,6 +191,7 @@ where
         let mut last_prompt_error = String::new();
 
         let mut last_text_response = String::new();
+        let mut accumulated_texts: Vec<String> = Vec::new();
         let mut is_text_response = false;
         let mut max_depth_reached = false;
 
@@ -435,12 +436,33 @@ where
                     turn_span.record("gen_ai.turn.reasoning", &turn_reasoning);
                 }
 
-                // Add (parallel) tool calls to chat history
+                // Add assistant message to chat history with reasoning,
+                // text, and tool calls so models see full context on
+                // subsequent turns.
                 if !tool_calls.is_empty() {
+                    let mut assistant_content: Vec<AssistantContent> = Vec::new();
+
+                    if !turn_reasoning.is_empty() {
+                        assistant_content.push(
+                            AssistantContent::reasoning(&turn_reasoning),
+                        );
+                    }
+                    if !last_text_response.is_empty() {
+                        assistant_content.push(
+                            AssistantContent::text(&last_text_response),
+                        );
+                        accumulated_texts.push(
+                            std::mem::take(&mut last_text_response),
+                        );
+                    }
+                    assistant_content.extend(tool_calls.clone());
+
                     chat_history.write().await.push(Message::Assistant {
                         id: None,
-                        content: OneOrMany::many(tool_calls.clone()).expect("Impossible EmptyListError"),
+                        content: OneOrMany::many(assistant_content)
+                            .expect("tool_calls is non-empty"),
                     });
+                    turn_reasoning.clear();
                 }
 
                 // Aggregate all tool results into a single Message::User
@@ -481,7 +503,15 @@ where
                     current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens);
                     current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens);
                     tracing::info!("Agent multi-turn stream finished");
-                    yield Ok(MultiTurnStreamItem::final_response(&last_text_response, aggregated_usage));
+
+                    // Include text from all turns, not just the last
+                    if !last_text_response.is_empty() {
+                        accumulated_texts.push(
+                            std::mem::take(&mut last_text_response),
+                        );
+                    }
+                    let final_text = accumulated_texts.join("\n\n");
+                    yield Ok(MultiTurnStreamItem::final_response(&final_text, aggregated_usage));
                     break;
                 }
             }
