@@ -235,6 +235,7 @@ where
                     gen_ai.turn.reasoning = tracing::field::Empty,
                 );
                 let mut turn_reasoning = String::new();
+                let mut turn_reasoning_signature: Option<String> = None;
 
                 if self.max_depth > 1 {
                     tracing::info!(
@@ -393,6 +394,9 @@ where
                         }
                         Ok(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })) => {
                             turn_reasoning.push_str(&reasoning.join("\n"));
+                            if signature.is_some() {
+                                turn_reasoning_signature = signature.clone();
+                            }
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
                             did_call_tool = false;
                         },
@@ -444,7 +448,10 @@ where
 
                     if !turn_reasoning.is_empty() {
                         assistant_content.push(
-                            AssistantContent::reasoning(&turn_reasoning),
+                            AssistantContent::Reasoning(
+                                crate::message::Reasoning::new(&turn_reasoning)
+                                    .with_signature(turn_reasoning_signature.take())
+                            ),
                         );
                     }
                     if !last_text_response.is_empty() {

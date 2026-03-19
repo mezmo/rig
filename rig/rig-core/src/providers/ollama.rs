@@ -930,9 +930,9 @@ impl From<Message> for crate::completion::Message {
                     );
                 }
 
-                assistant_contents.push(
-                    crate::completion::message::AssistantContent::Text(Text { text: content }),
-                );
+                assistant_contents.push(crate::completion::message::AssistantContent::Text(Text {
+                    text: content,
+                }));
 
                 for tc in tool_calls {
                     assistant_contents.push(

@@ -133,8 +133,17 @@ impl ToolServer {
                     .send(ToolServerResponse::ToolDeleted)
                     .unwrap();
             }
-            ToolServerRequestMessageKind::CallTool { name, args, caller_span } => {
-                match self.toolset.call(&name, args.clone()).instrument(caller_span).await {
+            ToolServerRequestMessageKind::CallTool {
+                name,
+                args,
+                caller_span,
+            } => {
+                match self
+                    .toolset
+                    .call(&name, args.clone())
+                    .instrument(caller_span)
+                    .await
+                {
                     Ok(result) => {
                         let _ = callback_channel.send(ToolServerResponse::ToolExecuted { result });
                     }
@@ -326,9 +335,17 @@ pub struct ToolServerRequest {
 pub enum ToolServerRequestMessageKind {
     AddTool(Box<dyn ToolDyn>),
     AppendToolset(ToolSet),
-    RemoveTool { tool_name: String },
-    CallTool { name: String, args: String, caller_span: tracing::Span },
-    GetToolDefs { prompt: Option<String> },
+    RemoveTool {
+        tool_name: String,
+    },
+    CallTool {
+        name: String,
+        args: String,
+        caller_span: tracing::Span,
+    },
+    GetToolDefs {
+        prompt: Option<String>,
+    },
 }
 
 #[derive(PartialEq, Debug)]

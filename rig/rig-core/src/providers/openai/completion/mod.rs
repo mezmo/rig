@@ -638,8 +638,7 @@ impl TryFrom<Message> for message::Message {
                 if let Some(reasoning) = reasoning_content
                     && !reasoning.is_empty()
                 {
-                    assistant_content
-                        .push(message::AssistantContent::reasoning(&reasoning));
+                    assistant_content.push(message::AssistantContent::reasoning(&reasoning));
                 }
 
                 assistant_content.extend(content.into_iter().map(|c| match c {
