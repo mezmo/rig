@@ -419,9 +419,11 @@ where
                                 }
 
                                 tracing::Span::current().record("gen_ai.completion", &last_text_response);
-                                yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Final(final_resp)));
                                 is_text_response = false;
                             }
+                            // Always yield Final so callers receive per-turn
+                            // token usage even on tool-call-only turns.
+                            yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Final(final_resp)));
                         }
                         Err(e) => {
                             yield Err(e.into());
