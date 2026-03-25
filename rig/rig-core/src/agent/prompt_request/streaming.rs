@@ -394,9 +394,7 @@ where
                         }
                         Ok(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })) => {
                             turn_reasoning.push_str(&reasoning.join("\n"));
-                            if signature.is_some() {
-                                turn_reasoning_signature = signature.clone();
-                            }
+                            turn_reasoning_signature = signature.clone();
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
                             did_call_tool = false;
                         },
