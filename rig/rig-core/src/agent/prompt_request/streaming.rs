@@ -191,6 +191,7 @@ where
         let mut last_prompt_error = String::new();
 
         let mut last_text_response = String::new();
+        let mut accumulated_texts: Vec<String> = Vec::new();
         let mut is_text_response = false;
         let mut max_depth_reached = false;
 
@@ -206,7 +207,6 @@ where
         // See also: https://github.com/rust-lang/rust-clippy/issues/8722
         let stream = async_stream::stream! {
             let mut current_prompt = prompt.clone();
-            let mut did_call_tool = false;
 
             'outer: loop {
                 if current_max_depth > self.max_depth + 1 {
@@ -234,6 +234,7 @@ where
                     gen_ai.turn.reasoning = tracing::field::Empty,
                 );
                 let mut turn_reasoning = String::new();
+                let mut turn_reasoning_signature: Option<String> = None;
 
                 if self.max_depth > 1 {
                     tracing::info!(
@@ -302,7 +303,6 @@ where
                                 }
                             }
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Text(text)));
-                            did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::ToolCall(tool_call)) => {
                             let tool_span = info_span!(
@@ -360,7 +360,6 @@ where
                                 tool_calls.push(tool_call_msg);
                                 tool_results.push((tool_call.id.clone(), tool_call.call_id.clone(), tool_result.clone()));
 
-                                did_call_tool = true;
                                 Ok(tool_result)
                             }.instrument(tool_span).await;
 
@@ -392,13 +391,12 @@ where
                         }
                         Ok(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })) => {
                             turn_reasoning.push_str(&reasoning.join("\n"));
+                            turn_reasoning_signature = signature.clone();
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
-                            did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::ReasoningDelta { reasoning, id }) => {
                             turn_reasoning.push_str(&reasoning);
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ReasoningDelta { reasoning, id }));
-                            did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::Final(final_resp)) => {
                             if let Some(usage) = final_resp.token_usage() { aggregated_usage += usage; };
@@ -414,9 +412,11 @@ where
                                 }
 
                                 tracing::Span::current().record("gen_ai.completion", &last_text_response);
-                                yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Final(final_resp)));
                                 is_text_response = false;
                             }
+                            // Always yield Final so callers receive per-turn
+                            // token usage even on tool-call-only turns.
+                            yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Final(final_resp)));
                         }
                         Err(e) => {
                             yield Err(e.into());
@@ -427,7 +427,7 @@ where
 
                 // Record turn-level enrichments
                 turn_span.record("gen_ai.turn.tool_count", tool_calls.len());
-                turn_span.record("gen_ai.turn.has_tool_calls", did_call_tool);
+                turn_span.record("gen_ai.turn.has_tool_calls", !tool_calls.is_empty());
                 if !last_text_response.is_empty() {
                     turn_span.record("gen_ai.turn.response", &last_text_response);
                 }
@@ -435,12 +435,36 @@ where
                     turn_span.record("gen_ai.turn.reasoning", &turn_reasoning);
                 }
 
-                // Add (parallel) tool calls to chat history
+                // Add assistant message to chat history with reasoning,
+                // text, and tool calls so models see full context on
+                // subsequent turns.
                 if !tool_calls.is_empty() {
+                    let mut assistant_content: Vec<AssistantContent> = Vec::new();
+
+                    if !turn_reasoning.is_empty() {
+                        assistant_content.push(
+                            AssistantContent::Reasoning(
+                                crate::message::Reasoning::new(&turn_reasoning)
+                                    .with_signature(turn_reasoning_signature.take())
+                            ),
+                        );
+                    }
+                    if !last_text_response.is_empty() {
+                        assistant_content.push(
+                            AssistantContent::text(&last_text_response),
+                        );
+                        accumulated_texts.push(
+                            std::mem::take(&mut last_text_response),
+                        );
+                    }
+                    assistant_content.extend(tool_calls.clone());
+
                     chat_history.write().await.push(Message::Assistant {
                         id: None,
-                        content: OneOrMany::many(tool_calls.clone()).expect("Impossible EmptyListError"),
+                        content: OneOrMany::many(assistant_content)
+                            .expect("tool_calls is non-empty"),
                     });
+                    turn_reasoning.clear();
                 }
 
                 // Aggregate all tool results into a single Message::User
@@ -476,12 +500,20 @@ where
                     None => unreachable!("Chat history should never be empty at this point"),
                 };
 
-                if !did_call_tool {
+                if tool_calls.is_empty() {
                     let current_span = tracing::Span::current();
                     current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens);
                     current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens);
                     tracing::info!("Agent multi-turn stream finished");
-                    yield Ok(MultiTurnStreamItem::final_response(&last_text_response, aggregated_usage));
+
+                    // Include text from all turns, not just the last
+                    if !last_text_response.is_empty() {
+                        accumulated_texts.push(
+                            std::mem::take(&mut last_text_response),
+                        );
+                    }
+                    let final_text = accumulated_texts.join("\n\n");
+                    yield Ok(MultiTurnStreamItem::final_response(&final_text, aggregated_usage));
                     break;
                 }
             }

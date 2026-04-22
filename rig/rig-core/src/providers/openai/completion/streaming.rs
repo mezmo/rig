@@ -38,6 +38,8 @@ struct StreamingDelta {
     content: Option<String>,
     #[serde(default, deserialize_with = "json_utils::null_or_vec")]
     tool_calls: Vec<StreamingToolCall>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -251,6 +253,14 @@ where
                                 });
                             }
                         }
+                    }
+
+                    // Reasoning content (e.g. Qwen-Thinking, DeepSeek via OpenAI-compatible API)
+                    if let Some(reasoning) = &delta.reasoning_content && !reasoning.is_empty() {
+                        yield Ok(streaming::RawStreamingChoice::ReasoningDelta {
+                            id: None,
+                            reasoning: reasoning.clone(),
+                        });
                     }
 
                     // Streamed text content
@@ -608,5 +618,162 @@ mod tests {
         let usage = final_usage.expect("expected a final response with usage");
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn test_streaming_delta_with_reasoning_content() {
+        let json = r#"{
+            "content": null,
+            "reasoning_content": "Let me think about this...",
+            "tool_calls": []
+        }"#;
+        let delta: StreamingDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            delta.reasoning_content,
+            Some("Let me think about this...".to_string())
+        );
+        assert!(delta.content.is_none());
+    }
+
+    #[test]
+    fn test_streaming_delta_without_reasoning_content() {
+        // Standard OpenAI response without reasoning_content field
+        let json = r#"{
+            "content": "Hello",
+            "tool_calls": []
+        }"#;
+        let delta: StreamingDelta = serde_json::from_str(json).unwrap();
+        assert!(delta.reasoning_content.is_none());
+        assert_eq!(delta.content, Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn test_streaming_delta_with_null_reasoning_content() {
+        let json = r#"{
+            "content": "Hello",
+            "reasoning_content": null,
+            "tool_calls": []
+        }"#;
+        let delta: StreamingDelta = serde_json::from_str(json).unwrap();
+        assert!(delta.reasoning_content.is_none());
+        assert_eq!(delta.content, Some("Hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_reasoning_delta_events() {
+        use bytes::Bytes;
+        use futures::StreamExt;
+
+        #[derive(Clone)]
+        struct MockHttpClient {
+            sse_bytes: Bytes,
+        }
+
+        impl crate::http_client::HttpClientExt for MockHttpClient {
+            fn send<T, U>(
+                &self,
+                _req: http::Request<T>,
+            ) -> impl std::future::Future<
+                Output = crate::http_client::Result<
+                    http::Response<crate::http_client::LazyBody<U>>,
+                >,
+            > + crate::wasm_compat::WasmCompatSend
+            + 'static
+            where
+                T: Into<Bytes>,
+                T: crate::wasm_compat::WasmCompatSend,
+                U: From<Bytes>,
+                U: crate::wasm_compat::WasmCompatSend + 'static,
+            {
+                std::future::ready(Err(crate::http_client::Error::InvalidStatusCode(
+                    http::StatusCode::NOT_IMPLEMENTED,
+                )))
+            }
+
+            fn send_multipart<U>(
+                &self,
+                _req: http::Request<crate::http_client::MultipartForm>,
+            ) -> impl std::future::Future<
+                Output = crate::http_client::Result<
+                    http::Response<crate::http_client::LazyBody<U>>,
+                >,
+            > + crate::wasm_compat::WasmCompatSend
+            + 'static
+            where
+                U: From<Bytes>,
+                U: crate::wasm_compat::WasmCompatSend + 'static,
+            {
+                std::future::ready(Err(crate::http_client::Error::InvalidStatusCode(
+                    http::StatusCode::NOT_IMPLEMENTED,
+                )))
+            }
+
+            fn send_streaming<T>(
+                &self,
+                _req: http::Request<T>,
+            ) -> impl std::future::Future<
+                Output = crate::http_client::Result<crate::http_client::StreamingResponse>,
+            > + crate::wasm_compat::WasmCompatSend
+            where
+                T: Into<Bytes>,
+            {
+                let sse_bytes = self.sse_bytes.clone();
+                async move {
+                    let byte_stream = futures::stream::iter(vec![Ok::<
+                        Bytes,
+                        crate::http_client::Error,
+                    >(sse_bytes)]);
+                    let boxed_stream: crate::http_client::sse::BoxedStream = Box::pin(byte_stream);
+
+                    http::Response::builder()
+                        .status(http::StatusCode::OK)
+                        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                        .body(boxed_stream)
+                        .map_err(crate::http_client::Error::Protocol)
+                }
+            }
+        }
+
+        // Simulate a Qwen-Thinking stream: reasoning chunks, then content, then done.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\",\"content\":null,\"tool_calls\":[]},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" step by step\",\"content\":null,\"tool_calls\":[]},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"content\":\"The answer is 42\",\"tool_calls\":[]},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":null,\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":10,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let client = MockHttpClient {
+            sse_bytes: Bytes::from(sse),
+        };
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .unwrap();
+
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .unwrap();
+
+        let mut reasoning_deltas = Vec::new();
+        let mut text_messages = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                streaming::StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                    reasoning_deltas.push(reasoning);
+                }
+                streaming::StreamedAssistantContent::Text(text) => {
+                    text_messages.push(text.text);
+                }
+                streaming::StreamedAssistantContent::Final(_) => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(reasoning_deltas, vec!["Let me think", " step by step"]);
+        assert_eq!(text_messages, vec!["The answer is 42"]);
     }
 }

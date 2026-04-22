@@ -1471,4 +1471,48 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_thinking_signature_round_trip() {
+        use crate::completion::message::{AssistantContent, Reasoning};
+
+        let signature = "test-sig-abc123".to_string();
+
+        // Anthropic Content::Thinking with a signature
+        let anthropic_content = Content::Thinking {
+            thinking: "Let me reason about this.".to_string(),
+            signature: Some(signature.clone()),
+        };
+
+        // Convert to rig AssistantContent
+        let assistant_content: AssistantContent = anthropic_content.try_into().unwrap();
+
+        // Verify it's a Reasoning variant with the signature preserved
+        match &assistant_content {
+            AssistantContent::Reasoning(Reasoning {
+                reasoning,
+                signature: sig,
+                ..
+            }) => {
+                assert_eq!(reasoning, &vec!["Let me reason about this.".to_string()]);
+                assert_eq!(sig.as_deref(), Some("test-sig-abc123"));
+            }
+            other => panic!("Expected Reasoning, got {:?}", other),
+        }
+
+        // Convert back to Anthropic Content
+        let round_tripped: Content = assistant_content.try_into().unwrap();
+
+        // Verify signature survives the round trip
+        match &round_tripped {
+            Content::Thinking {
+                thinking,
+                signature: sig,
+            } => {
+                assert_eq!(thinking, "Let me reason about this.");
+                assert_eq!(sig.as_deref(), Some("test-sig-abc123"));
+            }
+            other => panic!("Expected Thinking, got {:?}", other),
+        }
+    }
 }

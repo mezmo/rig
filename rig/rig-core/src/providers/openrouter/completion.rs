@@ -232,6 +232,7 @@ impl From<openai::Message> for Message {
             openai::Message::User { content, name } => Self::User { content, name },
             openai::Message::Assistant {
                 content,
+                reasoning_content,
                 refusal,
                 audio,
                 name,
@@ -242,7 +243,7 @@ impl From<openai::Message> for Message {
                 audio,
                 name,
                 tool_calls,
-                reasoning: None,
+                reasoning: reasoning_content,
                 reasoning_details: Vec::new(),
             },
             openai::Message::ToolResult {
