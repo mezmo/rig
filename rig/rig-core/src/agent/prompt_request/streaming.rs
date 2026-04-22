@@ -207,7 +207,6 @@ where
         // See also: https://github.com/rust-lang/rust-clippy/issues/8722
         let stream = async_stream::stream! {
             let mut current_prompt = prompt.clone();
-            let mut did_call_tool = false;
 
             'outer: loop {
                 if current_max_depth > self.max_depth + 1 {
@@ -304,7 +303,6 @@ where
                                 }
                             }
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Text(text)));
-                            did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::ToolCall(tool_call)) => {
                             let tool_span = info_span!(
@@ -362,7 +360,6 @@ where
                                 tool_calls.push(tool_call_msg);
                                 tool_results.push((tool_call.id.clone(), tool_call.call_id.clone(), tool_result.clone()));
 
-                                did_call_tool = true;
                                 Ok(tool_result)
                             }.instrument(tool_span).await;
 
@@ -396,12 +393,10 @@ where
                             turn_reasoning.push_str(&reasoning.join("\n"));
                             turn_reasoning_signature = signature.clone();
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
-                            did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::ReasoningDelta { reasoning, id }) => {
                             turn_reasoning.push_str(&reasoning);
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ReasoningDelta { reasoning, id }));
-                            did_call_tool = false;
                         },
                         Ok(StreamedAssistantContent::Final(final_resp)) => {
                             if let Some(usage) = final_resp.token_usage() { aggregated_usage += usage; };
@@ -432,7 +427,7 @@ where
 
                 // Record turn-level enrichments
                 turn_span.record("gen_ai.turn.tool_count", tool_calls.len());
-                turn_span.record("gen_ai.turn.has_tool_calls", did_call_tool);
+                turn_span.record("gen_ai.turn.has_tool_calls", !tool_calls.is_empty());
                 if !last_text_response.is_empty() {
                     turn_span.record("gen_ai.turn.response", &last_text_response);
                 }
@@ -505,7 +500,7 @@ where
                     None => unreachable!("Chat history should never be empty at this point"),
                 };
 
-                if !did_call_tool {
+                if tool_calls.is_empty() {
                     let current_span = tracing::Span::current();
                     current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens);
                     current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens);
