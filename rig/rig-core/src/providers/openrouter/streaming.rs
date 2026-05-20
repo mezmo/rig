@@ -255,20 +255,37 @@ where
                             }
                         }
 
-                        // Update the signature and the additional params of the tool call if present
-                        for reasoning_detail in &delta.reasoning_details {
-                            if let ReasoningDetails::Encrypted { id, data, .. } = reasoning_detail
-                                && let Some(id) = id
-                                && let Some(tool_call) = tool_calls.values_mut().find(|tool_call| tool_call.id.eq(id))
-                                && let Ok(additional_params) = serde_json::to_value(reasoning_detail) {
-                                tool_call.signature = Some(data.clone());
-                                tool_call.additional_params = Some(additional_params);
+                    }
+
+                    // Extract reasoning from reasoning_details (structured format)
+                    let mut has_reasoning_text = false;
+                    for reasoning_detail in &delta.reasoning_details {
+                        match reasoning_detail {
+                            ReasoningDetails::Encrypted { id, data, .. } => {
+                                if let Some(id) = id
+                                    && let Some(data) = data
+                                    && let Some(tool_call) = tool_calls.values_mut().find(|tc| tc.id.eq(id))
+                                    && let Ok(additional_params) = serde_json::to_value(reasoning_detail) {
+                                    tool_call.signature = Some(data.clone());
+                                    tool_call.additional_params = Some(additional_params);
+                                }
                             }
+                            ReasoningDetails::Text { text: Some(text), .. } if !text.is_empty() => {
+                                has_reasoning_text = true;
+                                yield Ok(streaming::RawStreamingChoice::ReasoningDelta {
+                                    reasoning: text.clone(),
+                                    id: None,
+                                });
+                            }
+                            _ => {}
                         }
                     }
 
-                    // Streamed reasoning content
-                    if let Some(reasoning) = &delta.reasoning && !reasoning.is_empty() {
+                    // Fall back to flat reasoning string when reasoning_details has no text
+                    if !has_reasoning_text
+                        && let Some(reasoning) = &delta.reasoning
+                        && !reasoning.is_empty()
+                    {
                         yield Ok(streaming::RawStreamingChoice::ReasoningDelta {
                             reasoning: reasoning.clone(),
                             id: None,
