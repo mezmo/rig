@@ -62,6 +62,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 content,
                 tool_calls,
                 reasoning,
+                reasoning_details,
                 ..
             } => {
                 let mut content = content
@@ -89,7 +90,20 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         .collect::<Vec<_>>(),
                 );
 
-                if let Some(reasoning) = reasoning {
+                let has_details_text = reasoning_details.iter().any(
+                    |d| matches!(d, ReasoningDetails::Text { text: Some(t), .. } if !t.is_empty()),
+                );
+                if has_details_text {
+                    for detail in reasoning_details {
+                        if let ReasoningDetails::Text {
+                            text: Some(text), ..
+                        } = detail
+                            && !text.is_empty()
+                        {
+                            content.push(completion::AssistantContent::reasoning(text));
+                        }
+                    }
+                } else if let Some(reasoning) = reasoning {
                     content.push(completion::AssistantContent::reasoning(reasoning));
                 }
 
@@ -196,14 +210,14 @@ pub enum ReasoningDetails {
         id: Option<String>,
         format: Option<String>,
         index: Option<usize>,
-        summary: String,
+        summary: Option<String>,
     },
     #[serde(rename = "reasoning.encrypted")]
     Encrypted {
         id: Option<String>,
         format: Option<String>,
         index: Option<usize>,
-        data: String,
+        data: Option<String>,
     },
     #[serde(rename = "reasoning.text")]
     Text {
@@ -294,7 +308,7 @@ impl TryFrom<OneOrMany<message::AssistantContent>> for Vec<Message> {
                                         id: Some(id),
                                         format,
                                         index: None,
-                                        data: signature.clone(),
+                                        data: Some(signature.clone()),
                                     })
                                 }
                             }
@@ -304,7 +318,7 @@ impl TryFrom<OneOrMany<message::AssistantContent>> for Vec<Message> {
                             id: tool_call.call_id.clone(),
                             format: None,
                             index: None,
-                            data: signature.clone(),
+                            data: Some(signature.clone()),
                         });
                     }
                     tool_calls.push(tool_call.into())
