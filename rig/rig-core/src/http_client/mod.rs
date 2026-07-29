@@ -11,6 +11,7 @@ pub mod sse;
 pub use multipart::MultipartForm;
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use crate::wasm_compat::*;
 
@@ -21,7 +22,7 @@ pub enum Error {
     #[error("Invalid status code: {0}")]
     InvalidStatusCode(StatusCode),
     #[error("Invalid status code {0} with message: {1}")]
-    InvalidStatusCodeWithMessage(StatusCode, String),
+    InvalidStatusCodeWithMessage(StatusCode, String, Option<Duration>),
     #[error("Header value outside of legal range: {0}")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("Request in error state, cannot access headers")]
@@ -49,6 +50,24 @@ pub(crate) fn instance_error<E: std::error::Error + Send + Sync + 'static>(error
 #[cfg(target_family = "wasm")]
 fn instance_error<E: std::error::Error + 'static>(error: E) -> Error {
     Error::Instance(error.into())
+}
+
+/// Build an [`Error::InvalidStatusCodeWithMessage`] from a non-success response,
+/// parsing a `Retry-After` header (if any) into the delay the error carries.
+pub(crate) fn invalid_status_with_body(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: String,
+) -> Error {
+    Error::InvalidStatusCodeWithMessage(status, body, parse_retry_after(headers))
+}
+
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(http::header::RETRY_AFTER)?;
+    // Only the integer-seconds form is supported; an HTTP-date or any other
+    // unparseable value is treated as absent.
+    let secs = value.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs))
 }
 
 pub type LazyBytes = WasmBoxedFuture<'static, Result<Bytes>>;
@@ -146,10 +165,10 @@ impl HttpClientExt for reqwest::Client {
         async move {
             let response = req.send().await.map_err(instance_error)?;
             if !response.status().is_success() {
-                return Err(Error::InvalidStatusCodeWithMessage(
-                    response.status(),
-                    response.text().await.unwrap(),
-                ));
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap();
+                return Err(invalid_status_with_body(status, &headers, body));
             }
 
             let mut res = Response::builder().status(response.status());
@@ -191,10 +210,10 @@ impl HttpClientExt for reqwest::Client {
         async move {
             let response = req.send().await.map_err(instance_error)?;
             if !response.status().is_success() {
-                return Err(Error::InvalidStatusCodeWithMessage(
-                    response.status(),
-                    response.text().await.unwrap(),
-                ));
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap();
+                return Err(invalid_status_with_body(status, &headers, body));
             }
 
             let mut res = Response::builder().status(response.status());
@@ -239,10 +258,10 @@ impl HttpClientExt for reqwest::Client {
         async move {
             let response: reqwest::Response = client.execute(req).await.map_err(instance_error)?;
             if !response.status().is_success() {
-                return Err(Error::InvalidStatusCodeWithMessage(
-                    response.status(),
-                    response.text().await.unwrap(),
-                ));
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap();
+                return Err(invalid_status_with_body(status, &headers, body));
             }
 
             #[cfg(not(target_family = "wasm"))]
@@ -291,10 +310,10 @@ impl HttpClientExt for reqwest_middleware::ClientWithMiddleware {
         async move {
             let response = req.send().await.map_err(instance_error)?;
             if !response.status().is_success() {
-                return Err(Error::InvalidStatusCodeWithMessage(
-                    response.status(),
-                    response.text().await.unwrap(),
-                ));
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap();
+                return Err(invalid_status_with_body(status, &headers, body));
             }
 
             let mut res = Response::builder().status(response.status());
@@ -336,10 +355,10 @@ impl HttpClientExt for reqwest_middleware::ClientWithMiddleware {
         async move {
             let response = req.send().await.map_err(instance_error)?;
             if !response.status().is_success() {
-                return Err(Error::InvalidStatusCodeWithMessage(
-                    response.status(),
-                    response.text().await.unwrap(),
-                ));
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap();
+                return Err(invalid_status_with_body(status, &headers, body));
             }
 
             let mut res = Response::builder().status(response.status());
@@ -384,10 +403,10 @@ impl HttpClientExt for reqwest_middleware::ClientWithMiddleware {
         async move {
             let response: reqwest::Response = client.execute(req).await.map_err(instance_error)?;
             if !response.status().is_success() {
-                return Err(Error::InvalidStatusCodeWithMessage(
-                    response.status(),
-                    response.text().await.unwrap(),
-                ));
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap();
+                return Err(invalid_status_with_body(status, &headers, body));
             }
 
             #[cfg(not(target_family = "wasm"))]
@@ -413,5 +432,26 @@ impl HttpClientExt for reqwest_middleware::ClientWithMiddleware {
 
             res.body(mapped_stream).map_err(Error::Protocol)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::StatusCode;
+
+    #[test]
+    fn retry_after_http_date_treated_as_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let err =
+            invalid_status_with_body(StatusCode::TOO_MANY_REQUESTS, &headers, "body".to_string());
+        assert!(matches!(
+            err,
+            Error::InvalidStatusCodeWithMessage(_, _, None)
+        ));
     }
 }
