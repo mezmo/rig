@@ -119,7 +119,7 @@ pub const DEFAULT_RETRY: ExponentialBackoff = ExponentialBackoff::new(
     None,
 );
 
-/// A [`RetryPolicy`] for retryable HTTP status responses (429, 500, 502, 503, 504, 529).
+/// A [`RetryPolicy`] for retryable HTTP status responses (408, 429, 500, 502, 503, 504, 529).
 #[derive(Debug, Clone)]
 pub struct StatusRetry {
     /// The initial backoff delay.
@@ -130,6 +130,12 @@ pub struct StatusRetry {
     pub max_duration: Duration,
     /// The maximum number of retry attempts before giving up.
     pub max_retries: usize,
+    /// The fraction of a backoff delay that may be shaved off at random,
+    /// clamped to `0.0..=1.0`; `0.0` disables jitter. Spreading retries keeps a
+    /// fleet of workers throttled by the same provider from resynchronizing on
+    /// every attempt. A `Retry-After` hint is honored as sent and never
+    /// jittered.
+    pub jitter: f64,
 }
 
 impl RetryPolicy for StatusRetry {
@@ -148,12 +154,7 @@ impl RetryPolicy for StatusRetry {
         }
         let delay = match retry_after {
             Some(hint) => hint.min(self.max_duration),
-            None => match last_retry {
-                Some((_, last_duration)) => {
-                    last_duration.mul_f64(self.factor).min(self.max_duration)
-                }
-                None => self.start,
-            },
+            None => self.jittered(self.backoff(retry_num)),
         };
         Some(delay)
     }
@@ -161,8 +162,27 @@ impl RetryPolicy for StatusRetry {
     fn set_reconnection_time(&mut self, _duration: Duration) {}
 }
 
+impl StatusRetry {
+    /// The delay is derived from the attempt count rather than the previous
+    /// delay so that jitter applies to one attempt instead of compounding into
+    /// the baseline of every attempt after it.
+    fn backoff(&self, retry_num: usize) -> Duration {
+        let scaled = self.start.as_secs_f64() * self.factor.powi(retry_num as i32);
+        Duration::from_secs_f64(scaled.min(self.max_duration.as_secs_f64()))
+    }
+
+    fn jittered(&self, delay: Duration) -> Duration {
+        let fraction = self.jitter.clamp(0.0, 1.0);
+        if fraction == 0.0 {
+            return delay;
+        }
+        let spread = delay.as_secs_f64() * fraction;
+        Duration::from_secs_f64(delay.as_secs_f64() - spread * fastrand::f64())
+    }
+}
+
 fn is_retryable_status(status: http::StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 /// The default [`StatusRetry`] used at stream open.
@@ -171,6 +191,7 @@ pub const DEFAULT_STATUS_RETRY: StatusRetry = StatusRetry {
     factor: 2.0,
     max_duration: Duration::from_secs(16),
     max_retries: 5,
+    jitter: 0.5,
 };
 
 #[cfg(test)]
@@ -178,6 +199,7 @@ mod tests {
     use super::*;
     use crate::http_client::instance_error;
     use http::StatusCode;
+    use std::collections::HashSet;
 
     fn status_err(status: u16, retry_after: Option<Duration>) -> Error {
         Error::InvalidStatusCodeWithMessage(
@@ -193,6 +215,7 @@ mod tests {
             factor: 2.0,
             max_duration: Duration::from_secs(10),
             max_retries: 5,
+            jitter: 0.0,
         }
     }
 
@@ -262,6 +285,7 @@ mod tests {
             factor: 2.0,
             max_duration: Duration::from_millis(4),
             max_retries: 3,
+            jitter: 0.0,
         };
         let mut last = None;
         let mut delays = Vec::new();
@@ -284,7 +308,87 @@ mod tests {
             factor: 2.0,
             max_duration: Duration::from_secs(10),
             max_retries: 0,
+            jitter: 0.0,
         };
         assert_eq!(p.retry(&status_err(429, None), None), None);
+    }
+
+    #[test]
+    fn request_timeout_is_retryable() {
+        let p = policy();
+        assert_eq!(
+            p.retry(&status_err(408, None), None),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn hint_does_not_shift_the_exponential_baseline() {
+        let p = policy();
+        let hint = Duration::from_secs(5);
+        assert_eq!(p.retry(&status_err(429, Some(hint)), None), Some(hint));
+        // The attempt after a hinted one resumes the schedule at `start *
+        // factor`, not at `hint * factor`.
+        assert_eq!(
+            p.retry(&status_err(429, None), Some((1, hint))),
+            Some(Duration::from_millis(200))
+        );
+    }
+
+    #[test]
+    fn jitter_shaves_only_downward_and_only_by_its_fraction() {
+        let p = StatusRetry {
+            jitter: 0.5,
+            ..policy()
+        };
+        for _ in 0..1_000 {
+            let delay = p.retry(&status_err(429, None), None).unwrap();
+            assert!(
+                (Duration::from_millis(50)..=Duration::from_millis(100)).contains(&delay),
+                "jittered delay {delay:?} escaped [50ms, 100ms]"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_leaves_retry_after_hints_alone() {
+        let p = StatusRetry {
+            jitter: 1.0,
+            ..policy()
+        };
+        let hint = Duration::from_secs(3);
+        for _ in 0..100 {
+            assert_eq!(p.retry(&status_err(429, Some(hint)), None), Some(hint));
+        }
+    }
+
+    #[test]
+    fn jitter_varies_between_attempts() {
+        let p = StatusRetry {
+            jitter: 0.5,
+            ..policy()
+        };
+        let delays: HashSet<Duration> = (0..100)
+            .map(|_| p.retry(&status_err(429, None), None).unwrap())
+            .collect();
+        assert!(
+            delays.len() > 1,
+            "jitter produced a single delay across 100 draws"
+        );
+    }
+
+    #[test]
+    fn backoff_saturates_instead_of_overflowing() {
+        let p = StatusRetry {
+            start: Duration::from_secs(1),
+            factor: 2.0,
+            max_duration: Duration::from_secs(16),
+            max_retries: usize::MAX,
+            jitter: 0.0,
+        };
+        assert_eq!(
+            p.retry(&status_err(429, None), Some((4_096, Duration::ZERO))),
+            Some(Duration::from_secs(16))
+        );
     }
 }

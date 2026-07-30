@@ -439,6 +439,7 @@ mod tests {
             factor: 2.0,
             max_duration: Duration::from_millis(4),
             max_retries: 3,
+            jitter: 0.0,
         }
     }
 
@@ -564,6 +565,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_then_open_408() {
+        let (client, calls) = MockClient::new(vec![
+            status_err(StatusCode::REQUEST_TIMEOUT, None),
+            sse_ok("data: {\"ok\":true}\r\n\r\n"),
+        ]);
+        let mut source = build_source(client);
+        assert!(matches!(source.next().await, Some(Ok(Event::Open))));
+        assert!(matches!(source.next().await, Some(Ok(Event::Message(_)))));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn status_retry_state_resets_between_cycles() {
         let (client, calls) = MockClient::new(vec![
             status_err(StatusCode::TOO_MANY_REQUESTS, None),
@@ -577,6 +590,7 @@ mod tests {
             factor: 2.0,
             max_duration: Duration::from_millis(4),
             max_retries: 1,
+            jitter: 0.0,
         });
         source.retry_policy = Box::new(Constant::new(Duration::from_millis(1), None));
         assert!(matches!(source.next().await, Some(Ok(Event::Open))));
@@ -602,6 +616,7 @@ mod tests {
             factor: 2.0,
             max_duration: Duration::from_millis(10),
             max_retries: 3,
+            jitter: 0.0,
         });
         let retry_start = std::time::Instant::now();
         assert!(matches!(source.next().await, Some(Ok(Event::Open))));
