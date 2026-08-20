@@ -127,7 +127,14 @@ pub enum Message {
         name: Option<String>,
     },
     Assistant {
-        #[serde(default, deserialize_with = "json_utils::string_or_vec")]
+        // OpenAI rejects `"content": []` (`invalid_request_error` /
+        // `empty_array`), so an empty vec must be omitted entirely — reached
+        // by history messages holding only tool calls and/or reasoning.
+        #[serde(
+            default,
+            deserialize_with = "json_utils::string_or_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
         content: Vec<AssistantContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -1231,5 +1238,59 @@ where
         CompletionError,
     > {
         Self::stream(self, request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An assistant history message holding only tool calls (no text) must
+    /// omit `content` entirely: OpenAI rejects `"content": []` with
+    /// `invalid_request_error` code `empty_array`. Reasoning models commonly
+    /// produce text-free tool-call turns, so this shape occurs on every
+    /// multi-turn conversation with them.
+    #[test]
+    fn assistant_message_with_only_tool_calls_omits_content() {
+        let message = Message::Assistant {
+            content: vec![],
+            reasoning_content: None,
+            refusal: None,
+            audio: None,
+            name: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                r#type: ToolType::default(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "Berlin"}),
+                },
+            }],
+        };
+
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(
+            json.get("content").is_none(),
+            "empty assistant content must be omitted, got: {json}"
+        );
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    /// Non-empty assistant content still serializes.
+    #[test]
+    fn assistant_message_with_text_keeps_content() {
+        let message = Message::Assistant {
+            content: vec![AssistantContent::Text {
+                text: "hello".to_string(),
+            }],
+            reasoning_content: None,
+            refusal: None,
+            audio: None,
+            name: None,
+            tool_calls: vec![],
+        };
+
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["content"][0]["text"], "hello");
     }
 }
