@@ -45,6 +45,8 @@ where
 {
     /// Name of the agent used for logging and debugging
     name: Option<String>,
+    provider_name: Option<String>,
+    model_name: Option<String>,
     /// Agent description. Primarily useful when using sub-agents as part of an agent workflow and converting agents to other formats.
     description: Option<String>,
     /// Completion model (e.g.: OpenAI's gpt-3.5-turbo-1106, Cohere's command-r)
@@ -76,6 +78,8 @@ where
     pub fn new(model: M) -> Self {
         Self {
             name: None,
+            provider_name: None,
+            model_name: None,
             description: None,
             model,
             preamble: None,
@@ -93,6 +97,18 @@ where
     /// Set the name of the agent
     pub fn name(mut self, name: &str) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Set the provider name recorded on telemetry spans (e.g. "openai")
+    pub fn provider_name(mut self, provider_name: &str) -> Self {
+        self.provider_name = Some(provider_name.into());
+        self
+    }
+
+    /// Set the model identifier recorded on telemetry spans (e.g. "gpt-4o")
+    pub fn model_name(mut self, model_name: &str) -> Self {
+        self.model_name = Some(model_name.into());
         self
     }
 
@@ -142,6 +158,8 @@ where
 
         AgentBuilderSimple {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: self.model,
             preamble: self.preamble,
@@ -166,6 +184,8 @@ where
 
         AgentBuilderSimple {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: self.model,
             preamble: self.preamble,
@@ -201,6 +221,8 @@ where
 
         AgentBuilderSimple {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: self.model,
             preamble: self.preamble,
@@ -240,6 +262,8 @@ where
 
         AgentBuilderSimple {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: self.model,
             preamble: self.preamble,
@@ -292,6 +316,8 @@ where
 
         AgentBuilderSimple {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: self.model,
             preamble: self.preamble,
@@ -336,6 +362,8 @@ where
 
         Agent {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: Arc::new(self.model),
             preamble: self.preamble,
@@ -378,6 +406,8 @@ where
 {
     /// Name of the agent used for logging and debugging
     name: Option<String>,
+    provider_name: Option<String>,
+    model_name: Option<String>,
     /// Agent description. Primarily useful when using sub-agents as part of an agent workflow and converting agents to other formats.
     description: Option<String>,
     /// Completion model (e.g.: OpenAI's gpt-3.5-turbo-1106, Cohere's command-r)
@@ -413,6 +443,8 @@ where
     pub fn new(model: M) -> Self {
         Self {
             name: None,
+            provider_name: None,
+            model_name: None,
             description: None,
             model,
             preamble: None,
@@ -432,6 +464,18 @@ where
     /// Set the name of the agent
     pub fn name(mut self, name: &str) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Set the provider name recorded on telemetry spans (e.g. "openai")
+    pub fn provider_name(mut self, provider_name: &str) -> Self {
+        self.provider_name = Some(provider_name.into());
+        self
+    }
+
+    /// Set the model identifier recorded on telemetry spans (e.g. "gpt-4o")
+    pub fn model_name(mut self, model_name: &str) -> Self {
+        self.model_name = Some(model_name.into());
         self
     }
 
@@ -571,6 +615,8 @@ where
 
         Agent {
             name: self.name,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
             description: self.description,
             model: Arc::new(self.model),
             preamble: self.preamble,

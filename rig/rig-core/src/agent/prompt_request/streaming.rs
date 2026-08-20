@@ -232,7 +232,17 @@ where
                     gen_ai.turn.has_tool_calls = tracing::field::Empty,
                     gen_ai.turn.response = tracing::field::Empty,
                     gen_ai.turn.reasoning = tracing::field::Empty,
+                    gen_ai.provider.name = tracing::field::Empty,
+                    gen_ai.request.model = tracing::field::Empty,
+                    gen_ai.usage.input_tokens = tracing::field::Empty,
+                    gen_ai.usage.output_tokens = tracing::field::Empty,
                 );
+                if let Some(provider) = agent.provider_name.as_deref() {
+                    turn_span.record("gen_ai.provider.name", provider);
+                }
+                if let Some(model) = agent.model_name.as_deref() {
+                    turn_span.record("gen_ai.request.model", model);
+                }
                 let mut turn_reasoning = String::new();
                 let mut turn_reasoning_signature: Option<String> = None;
 
@@ -399,7 +409,11 @@ where
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ReasoningDelta { reasoning, id }));
                         },
                         Ok(StreamedAssistantContent::Final(final_resp)) => {
-                            if let Some(usage) = final_resp.token_usage() { aggregated_usage += usage; };
+                            if let Some(usage) = final_resp.token_usage() {
+                                turn_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+                                turn_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                                aggregated_usage += usage;
+                            };
                             if is_text_response {
                                 if let Some(ref hook) = self.hook {
                                     hook.on_stream_completion_response_finish(&prompt, &final_resp, cancel_sig.clone()).await;

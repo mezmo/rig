@@ -54,6 +54,10 @@ where
 {
     /// Name of the agent used for logging and debugging
     pub name: Option<String>,
+    /// Provider name recorded on telemetry spans (e.g. "openai")
+    pub provider_name: Option<String>,
+    /// Model identifier recorded on telemetry spans (e.g. "gpt-4o")
+    pub model_name: Option<String>,
     /// Agent description. Primarily useful when using sub-agents as part of an agent workflow and converting agents to other formats.
     pub description: Option<String>,
     /// Completion model (e.g.: OpenAI's gpt-3.5-turbo-1106, Cohere's command-r)
