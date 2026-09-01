@@ -46,6 +46,8 @@ pub enum MultiTurnStreamItem<R> {
 pub struct FinalResponse {
     response: String,
     aggregated_usage: crate::completion::Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aggregated_cache_usage: Option<crate::completion::CacheUsage>,
 }
 
 impl FinalResponse {
@@ -53,6 +55,7 @@ impl FinalResponse {
         Self {
             response: String::new(),
             aggregated_usage: crate::completion::Usage::new(),
+            aggregated_cache_usage: None,
         }
     }
 
@@ -63,6 +66,12 @@ impl FinalResponse {
     pub fn usage(&self) -> crate::completion::Usage {
         self.aggregated_usage
     }
+
+    /// Prompt-cache token counts summed across every turn, if any turn
+    /// reported them.
+    pub fn cache_usage(&self) -> Option<crate::completion::CacheUsage> {
+        self.aggregated_cache_usage
+    }
 }
 
 impl<R> MultiTurnStreamItem<R> {
@@ -70,10 +79,15 @@ impl<R> MultiTurnStreamItem<R> {
         Self::StreamAssistantItem(item)
     }
 
-    pub fn final_response(response: &str, aggregated_usage: crate::completion::Usage) -> Self {
+    pub fn final_response(
+        response: &str,
+        aggregated_usage: crate::completion::Usage,
+        aggregated_cache_usage: Option<crate::completion::CacheUsage>,
+    ) -> Self {
         Self::FinalResponse(FinalResponse {
             response: response.to_string(),
             aggregated_usage,
+            aggregated_cache_usage,
         })
     }
 }
@@ -196,6 +210,7 @@ where
         let mut max_depth_reached = false;
 
         let mut aggregated_usage = crate::completion::Usage::new();
+        let mut aggregated_cache_usage: Option<crate::completion::CacheUsage> = None;
 
         let cancel_sig = CancelSignal::new();
 
@@ -414,6 +429,9 @@ where
                                 turn_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
                                 aggregated_usage += usage;
                             };
+                            if let Some(cache) = final_resp.cache_token_usage() {
+                                *aggregated_cache_usage.get_or_insert_with(Default::default) += cache;
+                            }
                             if is_text_response {
                                 if let Some(ref hook) = self.hook {
                                     hook.on_stream_completion_response_finish(&prompt, &final_resp, cancel_sig.clone()).await;
@@ -527,7 +545,7 @@ where
                         );
                     }
                     let final_text = accumulated_texts.join("\n\n");
-                    yield Ok(MultiTurnStreamItem::final_response(&final_text, aggregated_usage));
+                    yield Ok(MultiTurnStreamItem::final_response(&final_text, aggregated_usage, aggregated_cache_usage));
                     break;
                 }
             }

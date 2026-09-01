@@ -319,6 +319,13 @@ pub struct CacheUsage {
     pub cache_creation_input_tokens: u64,
 }
 
+impl AddAssign for CacheUsage {
+    fn add_assign(&mut self, other: Self) {
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
+}
+
 /// Struct representing the token usage for a completion request.
 /// If tokens used are `0`, then the provider failed to supply token usage metrics.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
