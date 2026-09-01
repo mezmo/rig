@@ -65,17 +65,23 @@ pub trait ProviderClient {
     fn from_val(input: Self::Input) -> Self;
 }
 
-use crate::completion::{GetTokenUsage, Usage};
+use crate::completion::{CacheUsage, GetTokenUsage, Usage};
 
 /// The final streaming response from a dynamic client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalCompletionResponse {
     pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_usage: Option<CacheUsage>,
 }
 
 impl GetTokenUsage for FinalCompletionResponse {
     fn token_usage(&self) -> Option<Usage> {
         self.usage
+    }
+
+    fn cache_token_usage(&self) -> Option<CacheUsage> {
+        self.cache_usage
     }
 }
 

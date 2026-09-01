@@ -405,6 +405,7 @@ impl<R: Clone + Unpin + GetTokenUsage> Stream for StreamingResultDyn<R> {
                 RawStreamingChoice::FinalResponse(res) => Poll::Ready(Some(Ok(
                     RawStreamingChoice::FinalResponse(FinalCompletionResponse {
                         usage: res.token_usage(),
+                        cache_usage: res.cache_token_usage(),
                     }),
                 ))),
                 RawStreamingChoice::Message(m) => {
