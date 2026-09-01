@@ -568,10 +568,7 @@ where
 
     let stream = stream! {
         let span = tracing::Span::current();
-        let mut final_usage = Usage {
-            prompt_tokens: 0,
-            total_tokens: 0
-        };
+        let mut final_usage = Usage::new();
 
         let mut text_response = String::new();
 

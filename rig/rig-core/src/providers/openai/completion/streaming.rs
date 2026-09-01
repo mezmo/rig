@@ -78,6 +78,10 @@ impl GetTokenUsage for StreamingCompletionResponse {
         usage.total_tokens = self.usage.total_tokens as u64;
         Some(usage)
     }
+
+    fn cache_token_usage(&self) -> Option<crate::completion::CacheUsage> {
+        self.usage.cache_token_usage()
+    }
 }
 
 impl<T> CompletionModel<T>
