@@ -183,6 +183,8 @@ where
                 gen_ai.completion = tracing::field::Empty,
                 gen_ai.usage.input_tokens = tracing::field::Empty,
                 gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.cache_read_input_tokens = tracing::field::Empty,
+                gen_ai.usage.cache_creation_input_tokens = tracing::field::Empty,
             )
         } else {
             tracing::Span::current()
@@ -251,6 +253,8 @@ where
                     gen_ai.request.model = tracing::field::Empty,
                     gen_ai.usage.input_tokens = tracing::field::Empty,
                     gen_ai.usage.output_tokens = tracing::field::Empty,
+                    gen_ai.usage.cache_read_input_tokens = tracing::field::Empty,
+                    gen_ai.usage.cache_creation_input_tokens = tracing::field::Empty,
                 );
                 if let Some(provider) = agent.provider_name.as_deref() {
                     turn_span.record("gen_ai.provider.name", provider);
@@ -293,6 +297,8 @@ where
                     gen_ai.response.model = tracing::field::Empty,
                     gen_ai.usage.output_tokens = tracing::field::Empty,
                     gen_ai.usage.input_tokens = tracing::field::Empty,
+                    gen_ai.usage.cache_read_input_tokens = tracing::field::Empty,
+                    gen_ai.usage.cache_creation_input_tokens = tracing::field::Empty,
                     gen_ai.input.messages = tracing::field::Empty,
                     gen_ai.output.messages = tracing::field::Empty,
                 );
@@ -430,6 +436,8 @@ where
                                 aggregated_usage += usage;
                             };
                             if let Some(cache) = final_resp.cache_token_usage() {
+                                turn_span.record("gen_ai.usage.cache_read_input_tokens", cache.cache_read_input_tokens);
+                                turn_span.record("gen_ai.usage.cache_creation_input_tokens", cache.cache_creation_input_tokens);
                                 *aggregated_cache_usage.get_or_insert_with(Default::default) += cache;
                             }
                             if is_text_response {
@@ -536,6 +544,10 @@ where
                     let current_span = tracing::Span::current();
                     current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens);
                     current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens);
+                    if let Some(cache) = aggregated_cache_usage {
+                        current_span.record("gen_ai.usage.cache_read_input_tokens", cache.cache_read_input_tokens);
+                        current_span.record("gen_ai.usage.cache_creation_input_tokens", cache.cache_creation_input_tokens);
+                    }
                     tracing::info!("Agent multi-turn stream finished");
 
                     // Include text from all turns, not just the last

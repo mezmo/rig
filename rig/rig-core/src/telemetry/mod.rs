@@ -63,6 +63,16 @@ impl SpanCombinator for tracing::Span {
             self.record("gen_ai.usage.input_tokens", usage.input_tokens);
             self.record("gen_ai.usage.output_tokens", usage.output_tokens);
         }
+        if let Some(cache) = usage.cache_token_usage() {
+            self.record(
+                "gen_ai.usage.cache_read_input_tokens",
+                cache.cache_read_input_tokens,
+            );
+            self.record(
+                "gen_ai.usage.cache_creation_input_tokens",
+                cache.cache_creation_input_tokens,
+            );
+        }
     }
 
     fn record_response_metadata<R>(&self, response: &R)
