@@ -76,16 +76,35 @@ pub struct PartialUsage {
     pub output_tokens: usize,
     #[serde(default)]
     pub input_tokens: Option<usize>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 impl GetTokenUsage for PartialUsage {
+    /// Folds cache read/creation tokens into `input_tokens`, mirroring the
+    /// non-streaming `Usage::token_usage` — Anthropic reports `input_tokens`
+    /// exclusive of cached tokens.
     fn token_usage(&self) -> Option<crate::completion::Usage> {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64;
+        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64
+            + self.cache_read_input_tokens.unwrap_or_default()
+            + self.cache_creation_input_tokens.unwrap_or_default();
         usage.output_tokens = self.output_tokens as u64;
         usage.total_tokens = usage.input_tokens + usage.output_tokens;
         Some(usage)
+    }
+
+    fn cache_token_usage(&self) -> Option<crate::completion::CacheUsage> {
+        if self.cache_read_input_tokens.is_none() && self.cache_creation_input_tokens.is_none() {
+            return None;
+        }
+        Some(crate::completion::CacheUsage {
+            cache_read_input_tokens: self.cache_read_input_tokens.unwrap_or_default(),
+            cache_creation_input_tokens: self.cache_creation_input_tokens.unwrap_or_default(),
+        })
     }
 }
 
@@ -109,13 +128,11 @@ pub struct StreamingCompletionResponse {
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
-        let mut usage = crate::completion::Usage::new();
-        usage.input_tokens = self.usage.input_tokens.unwrap_or(0) as u64;
-        usage.output_tokens = self.usage.output_tokens as u64;
-        usage.total_tokens =
-            self.usage.input_tokens.unwrap_or(0) as u64 + self.usage.output_tokens as u64;
+        self.usage.token_usage()
+    }
 
-        Some(usage)
+    fn cache_token_usage(&self) -> Option<crate::completion::CacheUsage> {
+        self.usage.cache_token_usage()
     }
 }
 
@@ -249,6 +266,8 @@ where
             let mut current_thinking: Option<ThinkingState> = None;
             let mut sse_stream = Box::pin(stream);
             let mut input_tokens = 0;
+            let mut cache_read_input_tokens = None;
+            let mut cache_creation_input_tokens = None;
             let mut final_usage = None;
 
             let mut text_content = String::new();
@@ -263,6 +282,8 @@ where
                                 match &event {
                                     StreamingEvent::MessageStart { message } => {
                                         input_tokens = message.usage.input_tokens;
+                                        cache_read_input_tokens = message.usage.cache_read_input_tokens;
+                                        cache_creation_input_tokens = message.usage.cache_creation_input_tokens;
 
                                         let span = tracing::Span::current();
                                         span.record("gen_ai.response.id", &message.id);
@@ -270,9 +291,13 @@ where
                                     },
                                     StreamingEvent::MessageDelta { delta, usage } => {
                                         if delta.stop_reason.is_some() {
+                                            // message_delta usage carries cumulative counts when
+                                            // present; fall back to message_start's otherwise.
                                             let usage = PartialUsage {
                                                  output_tokens: usage.output_tokens,
                                                  input_tokens: Some(input_tokens.try_into().expect("Failed to convert input_tokens to usize")),
+                                                 cache_read_input_tokens: usage.cache_read_input_tokens.or(cache_read_input_tokens),
+                                                 cache_creation_input_tokens: usage.cache_creation_input_tokens.or(cache_creation_input_tokens),
                                             };
 
                                             let span = tracing::Span::current();
@@ -733,5 +758,37 @@ mod tests {
 
         // Tool call state should be taken
         assert!(tool_call_state.is_none());
+    }
+
+    #[test]
+    fn test_partial_usage_folds_cache_tokens_into_input() {
+        let usage = PartialUsage {
+            output_tokens: 50,
+            input_tokens: Some(100),
+            cache_read_input_tokens: Some(18_000),
+            cache_creation_input_tokens: Some(2_000),
+        };
+
+        let folded = usage.token_usage().unwrap();
+        assert_eq!(folded.input_tokens, 20_100);
+        assert_eq!(folded.output_tokens, 50);
+        assert_eq!(folded.total_tokens, 20_150);
+
+        let cache = usage.cache_token_usage().unwrap();
+        assert_eq!(cache.cache_read_input_tokens, 18_000);
+        assert_eq!(cache.cache_creation_input_tokens, 2_000);
+    }
+
+    #[test]
+    fn test_partial_usage_without_cache_reports_none() {
+        let usage = PartialUsage {
+            output_tokens: 50,
+            input_tokens: Some(100),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+
+        assert_eq!(usage.token_usage().unwrap().input_tokens, 100);
+        assert!(usage.cache_token_usage().is_none());
     }
 }

@@ -125,6 +125,16 @@ impl GetTokenUsage for Usage {
 
         Some(usage)
     }
+
+    fn cache_token_usage(&self) -> Option<crate::completion::CacheUsage> {
+        if self.cache_read_input_tokens.is_none() && self.cache_creation_input_tokens.is_none() {
+            return None;
+        }
+        Some(crate::completion::CacheUsage {
+            cache_read_input_tokens: self.cache_read_input_tokens.unwrap_or_default(),
+            cache_creation_input_tokens: self.cache_creation_input_tokens.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
