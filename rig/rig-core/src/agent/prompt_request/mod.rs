@@ -466,8 +466,8 @@ where
                 }
 
                 agent_span.record("gen_ai.completion", &merged_texts);
-                agent_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
-                agent_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                agent_span.record("gen_ai.usage.input_tokens", usage.input_tokens as i64);
+                agent_span.record("gen_ai.usage.output_tokens", usage.output_tokens as i64);
 
                 // If there are no tool calls, depth is not relevant, we can just return the merged text response.
                 return Ok(PromptResponse::new(merged_texts, usage));
