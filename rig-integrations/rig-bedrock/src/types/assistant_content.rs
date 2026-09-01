@@ -42,11 +42,16 @@ impl TryFrom<AwsConverseOutput> for completion::CompletionResponse<AwsConverseOu
             )),
         }?;
 
+        // Folds cache read/write tokens into `input_tokens`, matching the
+        // streaming path — Bedrock reports `inputTokens` exclusive of cached
+        // tokens, while `totalTokens` already includes them.
         let usage = value
             .0
             .usage()
             .map(|usage| completion::Usage {
-                input_tokens: usage.input_tokens as u64,
+                input_tokens: usage.input_tokens as u64
+                    + usage.cache_read_input_tokens.unwrap_or_default() as u64
+                    + usage.cache_write_input_tokens.unwrap_or_default() as u64,
                 output_tokens: usage.output_tokens as u64,
                 total_tokens: usage.total_tokens as u64,
             })
@@ -189,6 +194,39 @@ mod tests {
             completion.choice,
             OneOrMany::one(AssistantContent::Text("txt".into()))
         );
+    }
+
+    #[test]
+    fn aws_converse_output_folds_cache_tokens_into_input() {
+        let message = aws_bedrock::Message::builder()
+            .role(aws_bedrock::ConversationRole::Assistant)
+            .content(aws_bedrock::ContentBlock::Text("txt".into()))
+            .build()
+            .unwrap();
+        let converse_output =
+            aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+                .output(aws_bedrock::ConverseOutput::Message(message))
+                .stop_reason(aws_bedrock::StopReason::EndTurn)
+                .build()
+                .unwrap();
+        let mut internal: InternalConverseOutput = converse_output.try_into().unwrap();
+        // Figures shaped like a Converse response with caching active:
+        // inputTokens excludes cached tokens, totalTokens includes them.
+        internal.usage = Some(crate::types::converse_output::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 20_150,
+            cache_read_input_tokens: Some(18_000),
+            cache_write_input_tokens: Some(2_000),
+        });
+
+        let completion: completion::CompletionResponse<AwsConverseOutput> =
+            AwsConverseOutput(internal).try_into().unwrap();
+        assert_eq!(
+            completion.usage.input_tokens, 20_100,
+            "cache tokens fold into input"
+        );
+        assert_eq!(completion.usage.total_tokens, 20_150);
     }
 
     #[test]
