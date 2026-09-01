@@ -895,6 +895,17 @@ pub struct Choice {
 pub struct Usage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Breakdown of `prompt_tokens` reported by the Chat Completions API.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from OpenAI's automatic prompt cache
+    /// (a subset of `prompt_tokens`).
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 impl Usage {
@@ -902,6 +913,7 @@ impl Usage {
         Self {
             prompt_tokens: 0,
             total_tokens: 0,
+            prompt_tokens_details: None,
         }
     }
 }
@@ -917,6 +929,7 @@ impl fmt::Display for Usage {
         let Usage {
             prompt_tokens,
             total_tokens,
+            prompt_tokens_details: _,
         } = self;
         write!(
             f,
@@ -933,6 +946,17 @@ impl GetTokenUsage for Usage {
         usage.total_tokens = self.total_tokens as u64;
 
         Some(usage)
+    }
+
+    /// OpenAI's automatic caching reports read tokens only — there is no
+    /// write-side count, so `cache_creation_input_tokens` is always zero.
+    fn cache_token_usage(&self) -> Option<crate::completion::CacheUsage> {
+        self.prompt_tokens_details
+            .as_ref()
+            .map(|details| crate::completion::CacheUsage {
+                cache_read_input_tokens: details.cached_tokens,
+                cache_creation_input_tokens: 0,
+            })
     }
 }
 
@@ -1292,5 +1316,27 @@ mod tests {
 
         let json = serde_json::to_value(&message).unwrap();
         assert_eq!(json["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn test_usage_parses_cached_tokens_from_prompt_tokens_details() {
+        let usage: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":1200,"completion_tokens":50,"total_tokens":1250,
+                "prompt_tokens_details":{"cached_tokens":1024,"audio_tokens":0}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage.token_usage().unwrap().input_tokens, 1200);
+        let cache = usage.cache_token_usage().unwrap();
+        assert_eq!(cache.cache_read_input_tokens, 1024);
+        assert_eq!(cache.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn test_usage_without_details_reports_no_cache_usage() {
+        let usage: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":100,"total_tokens":150}"#).unwrap();
+
+        assert!(usage.cache_token_usage().is_none());
     }
 }
