@@ -9,7 +9,18 @@ use rig::OneOrMany;
 use rig::completion::{CompletionError, Message};
 use rig::message::{DocumentMediaType, UserContent};
 
-pub struct AwsCompletionRequest(pub rig::completion::CompletionRequest);
+/// The bool enables prompt caching: `cachePoint` breakpoints are appended
+/// after the system prompt, the tool definitions, and the last message.
+pub struct AwsCompletionRequest(pub rig::completion::CompletionRequest, pub bool);
+
+/// A default-type cachePoint block, the breakpoint marker Bedrock's prompt
+/// caching keys on.
+fn cache_point_block() -> aws_bedrock::CachePointBlock {
+    aws_bedrock::CachePointBlock::builder()
+        .r#type(aws_bedrock::CachePointType::Default)
+        .build()
+        .expect("CachePointBlock builds when type is set")
+}
 
 impl AwsCompletionRequest {
     pub fn additional_params(&self) -> Option<aws_smithy_types::Document> {
@@ -81,6 +92,12 @@ impl AwsCompletionRequest {
                 }
             });
 
+            // Caching the tool definitions requires a cachePoint entry after
+            // the last tool.
+            if self.1 {
+                tools.push(Tool::CachePoint(cache_point_block()));
+            }
+
             let config = ToolConfiguration::builder()
                 .set_tools(Some(tools))
                 .set_tool_choice(tool_choice)
@@ -94,10 +111,13 @@ impl AwsCompletionRequest {
     }
 
     pub fn system_prompt(&self) -> Option<Vec<SystemContentBlock>> {
-        self.0
-            .preamble
-            .to_owned()
-            .map(|system_prompt| vec![SystemContentBlock::Text(system_prompt)])
+        self.0.preamble.to_owned().map(|system_prompt| {
+            let mut blocks = vec![SystemContentBlock::Text(system_prompt)];
+            if self.1 {
+                blocks.push(SystemContentBlock::CachePoint(cache_point_block()));
+            }
+            blocks
+        })
     }
 
     pub fn messages(&self) -> Result<Vec<aws_bedrock::Message>, CompletionError> {
@@ -124,10 +144,21 @@ impl AwsCompletionRequest {
             full_history.push(message.clone());
         });
 
-        full_history
+        let mut messages = full_history
             .into_iter()
             .map(|message| RigMessage(message).try_into())
-            .collect::<Result<Vec<aws_bedrock::Message>, _>>()
+            .collect::<Result<Vec<aws_bedrock::Message>, _>>()?;
+
+        // A cachePoint on the last message caches the whole conversation
+        // prefix for the next turn (multi-turn and tool-loop reuse).
+        if self.1
+            && let Some(last) = messages.last_mut()
+        {
+            last.content
+                .push(aws_bedrock::ContentBlock::CachePoint(cache_point_block()));
+        }
+
+        Ok(messages)
     }
 }
 
@@ -172,7 +203,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -204,7 +235,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -236,7 +267,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -265,7 +296,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -297,7 +328,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -323,7 +354,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -367,7 +398,7 @@ mod tests {
             ..minimal_request()
         };
 
-        let aws_request = AwsCompletionRequest(request);
+        let aws_request = AwsCompletionRequest(request, false);
         let tool_config = aws_request
             .tools_config()
             .expect("Should build tool config");
@@ -382,6 +413,67 @@ mod tests {
                 if spec.name() == "get_weather"
                 && spec.description() == Some("Get weather for a location")
             )
+        );
+    }
+
+    fn caching_request() -> CompletionRequest {
+        CompletionRequest {
+            preamble: Some("You are a test agent.".to_string()),
+            tools: vec![ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            ..minimal_request()
+        }
+    }
+
+    #[test]
+    fn test_prompt_caching_appends_cache_points() {
+        let aws_request = AwsCompletionRequest(caching_request(), true);
+
+        let system = aws_request.system_prompt().expect("preamble is set");
+        assert_eq!(system.len(), 2);
+        assert!(matches!(system[1], SystemContentBlock::CachePoint(_)));
+
+        let tools = aws_request
+            .tools_config()
+            .expect("Should build tool config")
+            .expect("tools are set");
+        assert_eq!(tools.tools().len(), 2);
+        assert!(matches!(
+            tools.tools().last(),
+            Some(aws_bedrock::Tool::CachePoint(_))
+        ));
+
+        let messages = aws_request.messages().expect("Should build messages");
+        let last = messages.last().expect("history is non-empty");
+        assert!(matches!(
+            last.content.last(),
+            Some(aws_bedrock::ContentBlock::CachePoint(_))
+        ));
+    }
+
+    #[test]
+    fn test_no_cache_points_when_caching_disabled() {
+        let aws_request = AwsCompletionRequest(caching_request(), false);
+
+        assert_eq!(
+            aws_request.system_prompt().expect("preamble is set").len(),
+            1
+        );
+        let tools = aws_request
+            .tools_config()
+            .expect("Should build tool config")
+            .expect("tools are set");
+        assert_eq!(tools.tools().len(), 1);
+        let messages = aws_request.messages().expect("Should build messages");
+        let last = messages.last().expect("history is non-empty");
+        assert!(
+            !last
+                .content
+                .iter()
+                .any(|block| matches!(block, aws_bedrock::ContentBlock::CachePoint(_)))
         );
     }
 }

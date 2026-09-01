@@ -20,14 +20,34 @@ pub struct BedrockUsage {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_write_input_tokens: Option<i32>,
 }
 
 impl GetTokenUsage for BedrockStreamingResponse {
+    /// Folds cache read/write tokens into `input_tokens` — Bedrock reports
+    /// `inputTokens` exclusive of cached tokens, while `totalTokens` already
+    /// includes them.
     fn token_usage(&self) -> Option<rig::completion::Usage> {
         self.usage.as_ref().map(|u| rig::completion::Usage {
-            input_tokens: u.input_tokens as u64,
+            input_tokens: u.input_tokens as u64
+                + u.cache_read_input_tokens.unwrap_or_default() as u64
+                + u.cache_write_input_tokens.unwrap_or_default() as u64,
             output_tokens: u.output_tokens as u64,
             total_tokens: u.total_tokens as u64,
+        })
+    }
+
+    fn cache_token_usage(&self) -> Option<rig::completion::CacheUsage> {
+        let usage = self.usage.as_ref()?;
+        if usage.cache_read_input_tokens.is_none() && usage.cache_write_input_tokens.is_none() {
+            return None;
+        }
+        Some(rig::completion::CacheUsage {
+            cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or_default() as u64,
+            cache_creation_input_tokens: usage.cache_write_input_tokens.unwrap_or_default() as u64,
         })
     }
 }
@@ -50,7 +70,7 @@ impl CompletionModel {
         &self,
         completion_request: rig::completion::CompletionRequest,
     ) -> Result<StreamingCompletionResponse<BedrockStreamingResponse>, CompletionError> {
-        let request = AwsCompletionRequest(completion_request);
+        let request = AwsCompletionRequest(completion_request, self.prompt_caching);
 
         let mut converse_builder = self
             .client
@@ -186,6 +206,8 @@ impl CompletionModel {
                                     input_tokens: usage.input_tokens,
                                     output_tokens: usage.output_tokens,
                                     total_tokens: usage.total_tokens,
+                                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                                    cache_write_input_tokens: usage.cache_write_input_tokens,
                                 }),
                             }));
                         }
@@ -209,6 +231,8 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
         };
 
         assert_eq!(usage.input_tokens, 100);
@@ -223,6 +247,8 @@ mod tests {
                 input_tokens: 200,
                 output_tokens: 75,
                 total_tokens: 275,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
             }),
         };
 
@@ -233,6 +259,31 @@ mod tests {
         assert_eq!(usage.input_tokens, 200);
         assert_eq!(usage.output_tokens, 75);
         assert_eq!(usage.total_tokens, 275);
+        assert!(response.cache_token_usage().is_none());
+    }
+
+    #[test]
+    fn test_bedrock_streaming_response_with_cache_usage() {
+        // Figures shaped like a Bedrock ConverseStream metadata event with
+        // caching active: inputTokens excludes cached tokens, totalTokens
+        // includes them.
+        let response = BedrockStreamingResponse {
+            usage: Some(BedrockUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 20_150,
+                cache_read_input_tokens: Some(18_000),
+                cache_write_input_tokens: Some(2_000),
+            }),
+        };
+
+        let usage = response.token_usage().unwrap();
+        assert_eq!(usage.input_tokens, 20_100, "cache tokens fold into input");
+        assert_eq!(usage.total_tokens, 20_150);
+
+        let cache = response.cache_token_usage().unwrap();
+        assert_eq!(cache.cache_read_input_tokens, 18_000);
+        assert_eq!(cache.cache_creation_input_tokens, 2_000);
     }
 
     #[test]
@@ -250,6 +301,8 @@ mod tests {
                 input_tokens: 448,
                 output_tokens: 68,
                 total_tokens: 516,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
             }),
         };
 
@@ -266,6 +319,8 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
         };
 
         // Test serialization
@@ -288,6 +343,8 @@ mod tests {
                 input_tokens: 200,
                 output_tokens: 75,
                 total_tokens: 275,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
             }),
         };
 

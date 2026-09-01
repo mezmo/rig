@@ -160,6 +160,10 @@ pub const STABILITY_STABLE_IMAGE_ULTRA_1_0_V1_0: &str = "stability.stable-image-
 pub struct CompletionModel {
     pub(crate) client: Client,
     pub model: String,
+    /// Emit `cachePoint` breakpoints for Bedrock prompt caching. Off by
+    /// default — Bedrock rejects cachePoints on models without caching
+    /// support, so this must be an explicit opt-in.
+    pub(crate) prompt_caching: bool,
 }
 
 impl CompletionModel {
@@ -167,7 +171,16 @@ impl CompletionModel {
         Self {
             client,
             model: model.into(),
+            prompt_caching: false,
         }
+    }
+
+    /// Enable Bedrock prompt caching (`cachePoint` breakpoints after the
+    /// system prompt, tool definitions, and last message). Only valid for
+    /// models that support prompt caching.
+    pub fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
     }
 }
 
@@ -185,7 +198,7 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse<AwsConverseOutput>, CompletionError> {
-        let request = AwsCompletionRequest(completion_request);
+        let request = AwsCompletionRequest(completion_request, self.prompt_caching);
 
         let mut converse_builder = self
             .client
