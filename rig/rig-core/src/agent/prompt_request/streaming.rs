@@ -431,13 +431,13 @@ where
                         },
                         Ok(StreamedAssistantContent::Final(final_resp)) => {
                             if let Some(usage) = final_resp.token_usage() {
-                                turn_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
-                                turn_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                                turn_span.record("gen_ai.usage.input_tokens", usage.input_tokens as i64);
+                                turn_span.record("gen_ai.usage.output_tokens", usage.output_tokens as i64);
                                 aggregated_usage += usage;
                             };
                             if let Some(cache) = final_resp.cache_token_usage() {
-                                turn_span.record("gen_ai.usage.cache_read_input_tokens", cache.cache_read_input_tokens);
-                                turn_span.record("gen_ai.usage.cache_creation_input_tokens", cache.cache_creation_input_tokens);
+                                turn_span.record("gen_ai.usage.cache_read_input_tokens", cache.cache_read_input_tokens as i64);
+                                turn_span.record("gen_ai.usage.cache_creation_input_tokens", cache.cache_creation_input_tokens as i64);
                                 *aggregated_cache_usage.get_or_insert_with(Default::default) += cache;
                             }
                             if is_text_response {
@@ -542,11 +542,11 @@ where
 
                 if tool_calls.is_empty() {
                     let current_span = tracing::Span::current();
-                    current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens);
-                    current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens);
+                    current_span.record("gen_ai.usage.input_tokens", aggregated_usage.input_tokens as i64);
+                    current_span.record("gen_ai.usage.output_tokens", aggregated_usage.output_tokens as i64);
                     if let Some(cache) = aggregated_cache_usage {
-                        current_span.record("gen_ai.usage.cache_read_input_tokens", cache.cache_read_input_tokens);
-                        current_span.record("gen_ai.usage.cache_creation_input_tokens", cache.cache_creation_input_tokens);
+                        current_span.record("gen_ai.usage.cache_read_input_tokens", cache.cache_read_input_tokens as i64);
+                        current_span.record("gen_ai.usage.cache_creation_input_tokens", cache.cache_creation_input_tokens as i64);
                     }
                     tracing::info!("Agent multi-turn stream finished");
 

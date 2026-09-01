@@ -59,18 +59,21 @@ impl SpanCombinator for tracing::Span {
             return;
         }
 
+        // Record as i64: tracing-opentelemetry's span visitor has no
+        // record_u64, so u64 values fall back to record_debug and export as
+        // string attributes instead of integers.
         if let Some(usage) = usage.token_usage() {
-            self.record("gen_ai.usage.input_tokens", usage.input_tokens);
-            self.record("gen_ai.usage.output_tokens", usage.output_tokens);
+            self.record("gen_ai.usage.input_tokens", usage.input_tokens as i64);
+            self.record("gen_ai.usage.output_tokens", usage.output_tokens as i64);
         }
         if let Some(cache) = usage.cache_token_usage() {
             self.record(
                 "gen_ai.usage.cache_read_input_tokens",
-                cache.cache_read_input_tokens,
+                cache.cache_read_input_tokens as i64,
             );
             self.record(
                 "gen_ai.usage.cache_creation_input_tokens",
-                cache.cache_creation_input_tokens,
+                cache.cache_creation_input_tokens as i64,
             );
         }
     }
