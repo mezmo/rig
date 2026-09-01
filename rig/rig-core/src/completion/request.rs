@@ -272,6 +272,11 @@ pub struct CompletionResponse<T> {
 /// Primarily designed for streamed completion responses in streamed multi-turn, as otherwise it would be impossible to do.
 pub trait GetTokenUsage {
     fn token_usage(&self) -> Option<crate::completion::Usage>;
+
+    /// Prompt-cache token counts for the request, if the provider reported any.
+    fn cache_token_usage(&self) -> Option<CacheUsage> {
+        None
+    }
 }
 
 impl GetTokenUsage for () {
@@ -291,6 +296,27 @@ where
             None
         }
     }
+
+    fn cache_token_usage(&self) -> Option<CacheUsage> {
+        if let Some(usage) = self {
+            usage.cache_token_usage()
+        } else {
+            None
+        }
+    }
+}
+
+/// Prompt-cache token counts for a completion request.
+///
+/// The counts break down the request's input tokens: tokens served from the
+/// provider's prompt cache vs. tokens written to it. They are a subset of
+/// `Usage::input_tokens`, not additional tokens.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CacheUsage {
+    /// Input tokens served from the provider's prompt cache.
+    pub cache_read_input_tokens: u64,
+    /// Input tokens written to the provider's prompt cache.
+    pub cache_creation_input_tokens: u64,
 }
 
 /// Struct representing the token usage for a completion request.
