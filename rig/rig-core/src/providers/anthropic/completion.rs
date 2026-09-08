@@ -732,14 +732,23 @@ where
 /// set or if set too high, the request will fail. The following values are based on the models
 /// available at the time of writing.
 fn calculate_max_tokens(model: &str) -> Option<u64> {
-    if model.starts_with("claude-opus-4") {
-        Some(32000)
-    } else if model.starts_with("claude-sonnet-4")
-        || model.starts_with("claude-3-7-sonnet")
+    if model.starts_with("claude-fable-5")
+        || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
-        || model.starts_with("claude-fable-5")
+        || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-opus-4-7")
+        || model.starts_with("claude-opus-4-6")
+        || model.starts_with("claude-sonnet-4-6")
+    {
+        Some(128_000)
+    } else if model.starts_with("claude-opus-4-5")
+        || model.starts_with("claude-sonnet-4")
+        || model.starts_with("claude-3-7-sonnet")
+        || model.starts_with("claude-haiku-4-5")
     {
         Some(64000)
+    } else if model.starts_with("claude-opus-4") {
+        Some(32000)
     } else if model.starts_with("claude-3-5-sonnet") || model.starts_with("claude-3-5-haiku") {
         Some(8192)
     } else if model.starts_with("claude-3-opus")
@@ -753,24 +762,7 @@ fn calculate_max_tokens(model: &str) -> Option<u64> {
 }
 
 fn calculate_max_tokens_custom(model: &str) -> u64 {
-    if model.starts_with("claude-opus-4") {
-        32000
-    } else if model.starts_with("claude-sonnet-4")
-        || model.starts_with("claude-3-7-sonnet")
-        || model.starts_with("claude-sonnet-5")
-        || model.starts_with("claude-fable-5")
-    {
-        64000
-    } else if model.starts_with("claude-3-5-sonnet") || model.starts_with("claude-3-5-haiku") {
-        8192
-    } else if model.starts_with("claude-3-opus")
-        || model.starts_with("claude-3-sonnet")
-        || model.starts_with("claude-3-haiku")
-    {
-        4096
-    } else {
-        2048
-    }
+    calculate_max_tokens(model).unwrap_or(2048)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
