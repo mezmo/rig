@@ -1,0 +1,51 @@
+name: "PR target branch"
+
+on:
+  # pull_request_target so the job can comment on pull requests from forks,
+  # which a fork-triggered pull_request token cannot do.
+  #
+  # DANGER: this runs with a repository token against pull requests from
+  # untrusted forks. It is safe only because nothing from the head revision is
+  # checked out or executed, and no pull-request-controlled string reaches a
+  # `run:` block. Do not add actions/checkout, and keep permissions scoped to
+  # pull-requests: write.
+  #
+  # GitHub reads this file from the pull request's base branch, so it must
+  # exist on main to guard pull requests into main.
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pr-target-branch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: "Warn on pull requests targeting main"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Pinned to a commit SHA because the tag is mutable and this step holds
+      # a write-scoped token.
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const base = pr.base.ref;
+            const {owner, repo} = context.repo;
+
+            if (base !== 'main') {
+              core.info(`Base branch is ${base}; nothing to check.`);
+              return;
+            }
+
+            const body = 
+            `**This pull request targets \`main\`. Please retarget it to \`mezmo\`.**
+
+            Use **Edit** next to the pull request title to change the base branch, then
+            rebase onto \`mezmo\` if the diff picked up unrelated commits.`;
+
+            await github.rest.issues.createComment({owner, repo, issue_number: pr.number, body});
