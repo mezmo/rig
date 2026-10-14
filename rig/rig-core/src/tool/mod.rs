@@ -12,6 +12,7 @@
 pub mod server;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use futures::Future;
 use serde::{Deserialize, Serialize};
@@ -134,6 +135,8 @@ pub trait Tool: Sized + WasmCompatSend + WasmCompatSync {
     /// The tool execution method.
     /// Both the arguments and return value are a String since these values are meant to
     /// be the output and input of LLM models (respectively)
+    ///
+    /// Calls can run at the same time, including calls to the same tool.
     fn call(
         &self,
         args: Self::Args,
@@ -370,9 +373,10 @@ where
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ToolType {
-    Simple(Box<dyn ToolDyn>),
-    Embedding(Box<dyn ToolEmbeddingDyn>),
+    Simple(Arc<dyn ToolDyn>),
+    Embedding(Arc<dyn ToolEmbeddingDyn>),
 }
 
 impl ToolType {
@@ -454,12 +458,13 @@ impl ToolSet {
     /// Add a tool to the toolset
     pub fn add_tool(&mut self, tool: impl ToolDyn + 'static) {
         self.tools
-            .insert(tool.name(), ToolType::Simple(Box::new(tool)));
+            .insert(tool.name(), ToolType::Simple(Arc::new(tool)));
     }
 
     /// Adds a boxed tool to the toolset. Useful for situations when dynamic dispatch is required.
     pub fn add_tool_boxed(&mut self, tool: Box<dyn ToolDyn>) {
-        self.tools.insert(tool.name(), ToolType::Simple(tool));
+        self.tools
+            .insert(tool.name(), ToolType::Simple(Arc::from(tool)));
     }
 
     pub fn delete_tool(&mut self, tool_name: &str) {
@@ -486,15 +491,7 @@ impl ToolSet {
 
     /// Call a tool with the given name and arguments
     pub async fn call(&self, toolname: &str, args: String) -> Result<String, ToolSetError> {
-        if let Some(tool) = self.tools.get(toolname) {
-            tracing::debug!(target: "rig",
-                "Calling tool {toolname} with args:\n{}",
-                serde_json::to_string_pretty(&args).unwrap()
-            );
-            Ok(tool.call(args).await?)
-        } else {
-            Err(ToolSetError::ToolNotFoundError(toolname.to_string()))
-        }
+        call_tool_named(toolname, self.tools.get(toolname), args).await
     }
 
     /// Get the documents of all the tools in the toolset
@@ -554,6 +551,21 @@ impl ToolSet {
     }
 }
 
+pub(crate) async fn call_tool_named(
+    toolname: &str,
+    tool: Option<&ToolType>,
+    args: String,
+) -> Result<String, ToolSetError> {
+    let Some(tool) = tool else {
+        return Err(ToolSetError::ToolNotFoundError(toolname.to_string()));
+    };
+    tracing::debug!(target: "rig",
+        "Calling tool {toolname} with args:\n{}",
+        serde_json::to_string_pretty(&args).unwrap()
+    );
+    Ok(tool.call(args).await?)
+}
+
 #[derive(Default)]
 pub struct ToolSetBuilder {
     tools: Vec<ToolType>,
@@ -561,12 +573,12 @@ pub struct ToolSetBuilder {
 
 impl ToolSetBuilder {
     pub fn static_tool(mut self, tool: impl ToolDyn + 'static) -> Self {
-        self.tools.push(ToolType::Simple(Box::new(tool)));
+        self.tools.push(ToolType::Simple(Arc::new(tool)));
         self
     }
 
     pub fn dynamic_tool(mut self, tool: impl ToolEmbeddingDyn + 'static) -> Self {
-        self.tools.push(ToolType::Embedding(Box::new(tool)));
+        self.tools.push(ToolType::Embedding(Arc::new(tool)));
         self
     }
 

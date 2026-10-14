@@ -61,7 +61,7 @@ reqwest-middleware = { version = "0.4.2", optional = true, features = [
 [dev-dependencies]
 anyhow = { workspace = true }
 assert_fs = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tokio-test = { workspace = true }
 redis = { version = "1.0.2", features = ["tokio-comp", "aio", "vector-sets"] }
