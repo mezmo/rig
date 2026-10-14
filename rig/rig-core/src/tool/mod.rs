@@ -564,7 +564,7 @@ pub(crate) async fn call_tool_named(
     };
     tracing::debug!(target: "rig",
         "Calling tool {toolname} with args:\n{}",
-        serde_json::to_string_pretty(&args).unwrap()
+        readable_args(&args)
     );
 
     // A panicking tool fails its own call. The caller carries on.
@@ -585,6 +585,12 @@ pub(crate) fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
         .copied()
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("no message")
+}
+
+fn readable_args(args: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(args)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| args.to_string())
 }
 
 #[derive(Default)]
@@ -652,6 +658,15 @@ mod tests {
             failed.to_string(),
             "ToolCallError: ToolCallError: tool `panics` panicked: tool blew up"
         );
+    }
+
+    #[test]
+    fn logged_args_read_as_json() {
+        assert_eq!(
+            readable_args(r#"{"x":2,"y":5}"#),
+            "{\n  \"x\": 2,\n  \"y\": 5\n}"
+        );
+        assert_eq!(readable_args("not json"), "not json");
     }
 
     fn get_test_toolset() -> ToolSet {
