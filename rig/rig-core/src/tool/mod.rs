@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use futures::Future;
+use futures::{Future, FutureExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -422,7 +422,7 @@ pub enum ToolSetError {
 }
 
 /// A struct that holds a set of tools
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolSet {
     pub(crate) tools: HashMap<String, ToolType>,
 }
@@ -490,6 +490,9 @@ impl ToolSet {
     }
 
     /// Call a tool with the given name and arguments
+    ///
+    /// A panicking tool returns an `Err` with the panic's message. On wasm a
+    /// panic aborts instead.
     pub async fn call(&self, toolname: &str, args: String) -> Result<String, ToolSetError> {
         call_tool_named(toolname, self.tools.get(toolname), args).await
     }
@@ -563,7 +566,25 @@ pub(crate) async fn call_tool_named(
         "Calling tool {toolname} with args:\n{}",
         serde_json::to_string_pretty(&args).unwrap()
     );
-    Ok(tool.call(args).await?)
+
+    // A panicking tool fails its own call. The caller carries on.
+    let result = std::panic::AssertUnwindSafe(tool.call(args))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| {
+            Err(ToolError::ToolCallError(
+                format!("tool `{toolname}` panicked: {}", panic_message(&panic)).into(),
+            ))
+        });
+    Ok(result?)
+}
+
+pub(crate) fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 #[derive(Default)]
@@ -598,6 +619,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    struct Panics;
+
+    impl ToolDyn for Panics {
+        fn name(&self) -> String {
+            "panics".to_string()
+        }
+
+        fn definition<'a>(&'a self, _prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
+            Box::pin(async {
+                ToolDefinition {
+                    name: "panics".to_string(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                }
+            })
+        }
+
+        fn call<'a>(&'a self, _args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            Box::pin(async { panic!("tool blew up") })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_fails_its_call_through_the_tool_set() {
+        let toolset = ToolSet::from_tools(vec![Panics]);
+
+        let failed = toolset.call("panics", "{}".to_string()).await.unwrap_err();
+
+        assert_eq!(
+            failed.to_string(),
+            "ToolCallError: ToolCallError: tool `panics` panicked: tool blew up"
+        );
+    }
 
     fn get_test_toolset() -> ToolSet {
         let mut toolset = ToolSet::default();

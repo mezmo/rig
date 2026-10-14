@@ -1,18 +1,20 @@
-use futures::{FutureExt, StreamExt, TryStreamExt, channel::oneshot::Canceled, stream};
-use tokio::sync::mpsc::{Sender, error::SendError};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 
 use crate::{
     completion::{CompletionError, ToolDefinition},
-    tool::{Tool, ToolDyn, ToolError, ToolSet, ToolSetError, ToolType, call_tool_named},
+    tool::{Tool, ToolDyn, ToolSet, ToolSetError, ToolType, call_tool_named, panic_message},
     vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndexDyn, request::Filter},
 };
 
+#[derive(Clone)]
 pub struct ToolServer {
     /// A list of static tool names.
     /// These tools will always exist on the tool server for as long as they are not deleted.
     static_tool_names: Vec<String>,
     /// Dynamic tools. These tools will be dynamically fetched from a given vector store.
-    dynamic_tools: Vec<(usize, Box<dyn VectorStoreIndexDyn + Send + Sync>)>,
+    dynamic_tools: Vec<(usize, Arc<dyn VectorStoreIndexDyn + Send + Sync>)>,
     /// The toolset where tools are called (to be executed).
     toolset: ToolSet,
 }
@@ -46,7 +48,10 @@ impl ToolServer {
         mut self,
         dyn_tools: Vec<(usize, Box<dyn VectorStoreIndexDyn + Send + Sync>)>,
     ) -> Self {
-        self.dynamic_tools = dyn_tools;
+        self.dynamic_tools = dyn_tools
+            .into_iter()
+            .map(|(sample, index)| (sample, Arc::from(index)))
+            .collect();
         self
     }
 
@@ -78,78 +83,19 @@ impl ToolServer {
         dynamic_tools: impl VectorStoreIndexDyn + Send + Sync + 'static,
         toolset: ToolSet,
     ) -> Self {
-        self.dynamic_tools.push((sample, Box::new(dynamic_tools)));
+        self.dynamic_tools.push((sample, Arc::new(dynamic_tools)));
         self.toolset.add_tools(toolset);
         self
     }
 
-    pub fn run(mut self) -> ToolServerHandle {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
-
-        #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
-        tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                self.handle_message(message).await;
-            }
-        });
-
-        // SAFETY: `rig` currently doesn't compile to WASM without the `worker` feature.
-        // Therefore, we can safely assume that the user won't try to compile to wasm without the worker feature.
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-        wasm_bindgen_futures::spawn_local(async move {
-            while let Some(message) = rx.recv().await {
-                self.handle_message(message).await;
-            }
-        });
-
-        ToolServerHandle(tx)
-    }
-
-    pub async fn handle_message(&mut self, message: ToolServerRequest) {
-        let ToolServerRequest {
-            callback_channel,
-            data,
-        } = message;
-
-        match data {
-            ToolServerRequestMessageKind::AddTool(tool) => {
-                self.static_tool_names.push(tool.name());
-                self.toolset.add_tool_boxed(tool);
-                callback_channel
-                    .send(ToolServerResponse::ToolAdded)
-                    .unwrap();
-            }
-            ToolServerRequestMessageKind::AppendToolset(tools) => {
-                self.toolset.add_tools(tools);
-                callback_channel
-                    .send(ToolServerResponse::ToolAdded)
-                    .unwrap();
-            }
-            ToolServerRequestMessageKind::RemoveTool { tool_name } => {
-                self.static_tool_names.retain(|x| *x != tool_name);
-                self.toolset.delete_tool(&tool_name);
-                callback_channel
-                    .send(ToolServerResponse::ToolDeleted)
-                    .unwrap();
-            }
-            ToolServerRequestMessageKind::GetTool { name } => {
-                let tool = self.toolset.get(&name).cloned().map(ResolvedTool);
-                let _ = callback_channel.send(ToolServerResponse::Tool(tool));
-            }
-            ToolServerRequestMessageKind::GetToolDefs { prompt } => {
-                let res = self.get_tool_definitions(prompt).await.unwrap();
-                callback_channel
-                    .send(ToolServerResponse::ToolDefinitions(res))
-                    .unwrap();
-            }
-        }
+    pub fn run(self) -> ToolServerHandle {
+        ToolServerHandle(Arc::new(RwLock::new(self)))
     }
 
     pub async fn get_tool_definitions(
-        &mut self,
+        &self,
         text: Option<String>,
     ) -> Result<Vec<ToolDefinition>, CompletionError> {
-        let static_tool_names = self.static_tool_names.clone();
         let mut tools = if let Some(text) = text {
             stream::iter(self.dynamic_tools.iter())
                         .then(|(num_sample, index)| async {
@@ -184,8 +130,8 @@ impl ToolServer {
             Vec::new()
         };
 
-        for toolname in static_tool_names {
-            if let Some(tool) = self.toolset.get(&toolname) {
+        for toolname in &self.static_tool_names {
+            if let Some(tool) = self.toolset.get(toolname) {
                 tools.push(tool.definition(String::new()).await)
             } else {
                 tracing::warn!("Tool implementation not found in toolset: {}", toolname);
@@ -197,195 +143,120 @@ impl ToolServer {
 }
 
 #[derive(Clone)]
-pub struct ToolServerHandle(Sender<ToolServerRequest>);
+pub struct ToolServerHandle(Arc<RwLock<ToolServer>>);
 
 impl ToolServerHandle {
+    fn read(&self) -> RwLockReadGuard<'_, ToolServer> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Held only to move tools in and out of the map. A tool's own code, its
+    /// name and its drop included, runs after the lock is released.
+    fn write(&self) -> RwLockWriteGuard<'_, ToolServer> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub async fn add_tool(&self, tool: impl ToolDyn + 'static) -> Result<(), ToolServerError> {
-        let tool = Box::new(tool);
-
-        let (tx, rx) = futures::channel::oneshot::channel();
-
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::AddTool(tool),
-            })
-            .await?;
-
-        let res = rx.await?;
-
-        let ToolServerResponse::ToolAdded = res else {
-            return Err(ToolServerError::InvalidMessage(res));
+        let name = tool.name();
+        let tool = ToolType::Simple(Arc::new(tool));
+        let replaced = {
+            let mut server = self.write();
+            server.static_tool_names.push(name.clone());
+            server.toolset.tools.insert(name, tool)
         };
-
+        drop(replaced);
         Ok(())
     }
 
     pub async fn append_toolset(&self, toolset: ToolSet) -> Result<(), ToolServerError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::AppendToolset(toolset),
-            })
-            .await?;
-
-        let res = rx.await?;
-
-        let ToolServerResponse::ToolAdded = res else {
-            return Err(ToolServerError::InvalidMessage(res));
+        let replaced: Vec<ToolType> = {
+            let mut server = self.write();
+            toolset
+                .tools
+                .into_iter()
+                .filter_map(|(name, tool)| server.toolset.tools.insert(name, tool))
+                .collect()
         };
-
+        drop(replaced);
         Ok(())
     }
 
     /// Removes `tool_name` for new calls. A call already running keeps the
     /// tool until it finishes, and this does not wait for it.
     pub async fn remove_tool(&self, tool_name: &str) -> Result<(), ToolServerError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::RemoveTool {
-                    tool_name: tool_name.to_string(),
-                },
-            })
-            .await?;
-
-        let res = rx.await?;
-
-        let ToolServerResponse::ToolDeleted = res else {
-            return Err(ToolServerError::InvalidMessage(res));
+        let removed = {
+            let mut server = self.write();
+            server.static_tool_names.retain(|name| name != tool_name);
+            server.toolset.tools.remove(tool_name)
         };
-
+        drop(removed);
         Ok(())
     }
 
     /// Runs `tool_name` in the caller's task, so the call sees the caller's
     /// task-locals and span, and calls from different callers run at the same
-    /// time. The server only hands over the tool, and it handles one request at
-    /// a time, so the lookup can wait behind a tool-definitions fetch.
+    /// time.
+    ///
+    /// A panicking tool returns an `Err` with the panic's message. On wasm a
+    /// panic aborts instead.
     pub async fn call_tool(&self, tool_name: &str, args: &str) -> Result<String, ToolServerError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::GetTool {
-                    name: tool_name.to_string(),
-                },
-            })
-            .await?;
-
-        let tool = match rx.await? {
-            ToolServerResponse::Tool(tool) => tool,
-            invalid => return Err(ToolServerError::InvalidMessage(invalid)),
-        };
-
-        // A panicking tool fails its own call. The caller's run and the
-        // server carry on.
-        let call = call_tool_named(tool_name, tool.as_ref().map(|t| &t.0), args.to_string());
-        std::panic::AssertUnwindSafe(call)
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|panic| {
-                Err(ToolSetError::ToolCallError(ToolError::ToolCallError(
-                    format!("tool `{tool_name}` panicked: {}", panic_message(&panic)).into(),
-                )))
-            })
-            .map_err(|err| {
-                // Callers match on this text. The tool set's error is
-                // stringified inside a tool call error.
-                ToolServerError::ToolsetError(ToolSetError::ToolCallError(
-                    ToolError::ToolCallError(err.to_string().into()),
-                ))
-            })
+        let tool = self.read().toolset.get(tool_name).cloned();
+        Ok(call_tool_named(tool_name, tool.as_ref(), args.to_string()).await?)
     }
 
+    /// Fetches tool definitions from a copy of the server taken under the
+    /// lock, so the fetch never holds the lock while it awaits.
     pub async fn get_tool_defs(
         &self,
         prompt: Option<String>,
     ) -> Result<Vec<ToolDefinition>, ToolServerError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
+        let server = self.read().clone();
 
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::GetToolDefs { prompt },
+        // A panicking definition or store fails this fetch, not the caller.
+        std::panic::AssertUnwindSafe(server.get_tool_definitions(prompt))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                Err(CompletionError::RequestError(
+                    format!("tool definitions panicked: {}", panic_message(&panic)).into(),
+                ))
             })
-            .await?;
-
-        let res = rx.await?;
-
-        let ToolServerResponse::ToolDefinitions(tooldefs) = res else {
-            return Err(ToolServerError::InvalidMessage(res));
-        };
-
-        Ok(tooldefs)
-    }
-}
-
-/// Returns the text a panic carried, or "no message" when it carried none.
-fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
-    panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("no message")
-}
-
-pub struct ToolServerRequest {
-    callback_channel: futures::channel::oneshot::Sender<ToolServerResponse>,
-    data: ToolServerRequestMessageKind,
-}
-
-pub enum ToolServerRequestMessageKind {
-    AddTool(Box<dyn ToolDyn>),
-    AppendToolset(ToolSet),
-    RemoveTool { tool_name: String },
-    GetTool { name: String },
-    GetToolDefs { prompt: Option<String> },
-}
-
-#[derive(Debug)]
-pub enum ToolServerResponse {
-    ToolAdded,
-    ToolDeleted,
-    Tool(Option<ResolvedTool>),
-    ToolDefinitions(Vec<ToolDefinition>),
-}
-
-/// A tool the server handed to a caller to run.
-pub struct ResolvedTool(ToolType);
-
-impl std::fmt::Debug for ResolvedTool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("ResolvedTool").field(&self.0.name()).finish()
+            .map_err(ToolServerError::DefinitionsFailed)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ToolServerError {
-    #[error("Sending message was cancelled")]
-    Canceled(#[from] Canceled),
     #[error("Toolset error: {0}")]
     ToolsetError(#[from] ToolSetError),
-    #[error("Error while sending message: {0}")]
-    SendError(#[from] SendError<ToolServerRequest>),
-    #[error("An invalid message type was returned")]
-    InvalidMessage(ToolServerResponse),
+    #[error("Tool definitions failed: {0}")]
+    DefinitionsFailed(#[source] CompletionError),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use tokio::sync::Barrier;
 
     use crate::{
         completion::ToolDefinition,
-        tool::{Tool, server::ToolServer},
+        tool::{
+            Tool, ToolError, ToolSet, ToolSetError,
+            server::{ToolServer, ToolServerError},
+        },
+        vector_store::{
+            TopNResults, VectorSearchRequest, VectorStoreError, VectorStoreIndexDyn,
+            request::Filter,
+        },
+        wasm_compat::WasmBoxedFuture,
     };
 
     #[derive(Deserialize)]
@@ -434,6 +305,14 @@ mod tests {
         }
     }
 
+    fn bare_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
     struct ReadsCaller;
 
     tokio::task_local! {
@@ -447,11 +326,7 @@ mod tests {
         type Output = String;
 
         async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: String::new(),
-                parameters: json!({"type": "object"}),
-            }
+            bare_definition(Self::NAME)
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -462,7 +337,7 @@ mod tests {
     }
 
     /// Returns once two calls are inside it at the same time.
-    struct Meets(std::sync::Arc<tokio::sync::Barrier>);
+    struct Meets(Arc<Barrier>);
 
     impl Tool for Meets {
         const NAME: &'static str = "meets";
@@ -471,11 +346,7 @@ mod tests {
         type Output = String;
 
         async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: String::new(),
-                parameters: json!({"type": "object"}),
-            }
+            bare_definition(Self::NAME)
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -497,11 +368,7 @@ mod tests {
         type Output = String;
 
         async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: String::new(),
-                parameters: json!({"type": "object"}),
-            }
+            bare_definition(Self::NAME)
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -518,11 +385,7 @@ mod tests {
         type Output = String;
 
         async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: String::new(),
-                parameters: json!({"type": "object"}),
-            }
+            bare_definition(Self::NAME)
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -537,15 +400,15 @@ mod tests {
         let failed = handle.call_tool("panics", "{}").await.unwrap_err();
         assert_eq!(
             failed.to_string(),
-            "Toolset error: ToolCallError: ToolCallError: ToolCallError: \
+            "Toolset error: ToolCallError: ToolCallError: \
              tool `panics` panicked: tool blew up"
         );
 
         let next = handle.call_tool("add", r#"{"x": 1, "y": 2}"#).await;
-        assert_eq!(next.unwrap(), "3", "the server keeps serving calls");
+        assert_eq!(next.unwrap(), "3", "the handle keeps serving calls");
     }
 
-    struct Slow(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    struct Slow(Arc<AtomicBool>);
 
     impl Tool for Slow {
         const NAME: &'static str = "slow";
@@ -554,37 +417,201 @@ mod tests {
         type Output = String;
 
         async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: String::new(),
-                parameters: json!({"type": "object"}),
-            }
+            bare_definition(Self::NAME)
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.0.store(true, Ordering::SeqCst);
             Ok("done".into())
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_caller_stops_the_tool() {
-        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
         let handle = ToolServer::new().tool(Slow(finished.clone())).run();
 
-        let gave_up = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            handle.call_tool("slow", "{}"),
-        )
-        .await;
+        let gave_up =
+            tokio::time::timeout(Duration::from_millis(10), handle.call_tool("slow", "{}")).await;
         assert!(gave_up.is_err(), "the caller stops waiting first");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            !finished.load(Ordering::SeqCst),
             "a dropped call does not run to its end"
         );
+    }
+
+    struct SlowDefinition;
+
+    impl Tool for SlowDefinition {
+        const NAME: &'static str = "slow_definition";
+        type Error = MathError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> ToolDefinition {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            bare_definition(Self::NAME)
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("ok".into())
+        }
+    }
+
+    struct PanickyDefinition;
+
+    impl Tool for PanickyDefinition {
+        const NAME: &'static str = "panicky_definition";
+        type Error = MathError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> ToolDefinition {
+            panic!("definition blew up")
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("ok".into())
+        }
+    }
+
+    struct FailingIndex;
+
+    impl VectorStoreIndexDyn for FailingIndex {
+        fn top_n<'a>(
+            &'a self,
+            _req: VectorSearchRequest<Filter<serde_json::Value>>,
+        ) -> WasmBoxedFuture<'a, TopNResults> {
+            Box::pin(async { Err(store_down()) })
+        }
+
+        fn top_n_ids<'a>(
+            &'a self,
+            _req: VectorSearchRequest<Filter<serde_json::Value>>,
+        ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>> {
+            Box::pin(async { Err(store_down()) })
+        }
+    }
+
+    fn store_down() -> VectorStoreError {
+        VectorStoreError::DatastoreError("store is down".into())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_stops_waiting_leaves_the_handle_working() {
+        let handle = ToolServer::new().tool(SlowDefinition).tool(Adder).run();
+
+        let gave_up =
+            tokio::time::timeout(Duration::from_millis(10), handle.get_tool_defs(None)).await;
+        assert!(gave_up.is_err(), "the caller stops waiting first");
+
+        let next = handle.call_tool("add", r#"{"x": 1, "y": 2}"#).await;
+        assert_eq!(next.unwrap(), "3", "the handle keeps serving calls");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_does_not_wait_behind_a_definitions_fetch() {
+        let handle = ToolServer::new().tool(SlowDefinition).tool(Adder).run();
+        let fetch = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.get_tool_defs(None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let call = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.call_tool("add", r#"{"x": 1, "y": 2}"#),
+        )
+        .await
+        .expect("the call must not wait for the fetch to finish");
+
+        assert_eq!(call.unwrap(), "3");
+        assert_eq!(fetch.await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_definitions_lookup_comes_back_as_an_error() {
+        let handle = ToolServer::new()
+            .dynamic_tools(1, FailingIndex, ToolSet::default())
+            .tool(Adder)
+            .run();
+
+        let failed = handle.get_tool_defs(Some("query".into())).await;
+        assert!(
+            matches!(failed, Err(ToolServerError::DefinitionsFailed(_))),
+            "{failed:?}"
+        );
+        let cause = std::error::Error::source(&failed.unwrap_err()).map(ToString::to_string);
+        assert_eq!(
+            cause.as_deref(),
+            Some("RequestError: Datastore error: store is down")
+        );
+
+        let next = handle.call_tool("add", r#"{"x": 1, "y": 2}"#).await;
+        assert_eq!(next.unwrap(), "3", "the handle keeps serving calls");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_definition_fails_only_its_fetch() {
+        let handle = ToolServer::new().tool(PanickyDefinition).tool(Adder).run();
+
+        let failed = handle.get_tool_defs(None).await.unwrap_err();
+        assert_eq!(
+            failed.to_string(),
+            "Tool definitions failed: RequestError: tool definitions panicked: definition blew up"
+        );
+
+        let next = handle.call_tool("add", r#"{"x": 1, "y": 2}"#).await;
+        assert_eq!(next.unwrap(), "3", "the handle keeps serving calls");
+    }
+
+    struct SlowDrop;
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    impl Tool for SlowDrop {
+        const NAME: &'static str = "slow_drop";
+        type Error = MathError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> ToolDefinition {
+            bare_definition(Self::NAME)
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("ok".into())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_tool_does_not_hold_up_other_calls() {
+        let handle = ToolServer::new().tool(SlowDrop).tool(Adder).run();
+        let remover = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.remove_tool("slow_drop").await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // A blocked lock stalls the thread itself, so a timeout around the
+        // call would never fire. Measure the call instead.
+        let start = std::time::Instant::now();
+        let call = handle.call_tool("add", r#"{"x": 1, "y": 2}"#).await;
+        let waited = start.elapsed();
+
+        assert_eq!(call.unwrap(), "3");
+        assert!(
+            waited < Duration::from_millis(100),
+            "the call waited {waited:?} for the removed tool to drop"
+        );
+        remover.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -601,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn calls_from_different_tasks_run_at_the_same_time() {
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let barrier = Arc::new(Barrier::new(2));
         let handle = ToolServer::new().tool(Meets(barrier)).run();
         let call_from_a_task = || {
             let handle = handle.clone();
@@ -609,7 +636,7 @@ mod tests {
         };
         let (first, second) = (call_from_a_task(), call_from_a_task());
 
-        let both = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let both = tokio::time::timeout(Duration::from_secs(5), async {
             (first.await.unwrap(), second.await.unwrap())
         })
         .await
@@ -626,14 +653,34 @@ mod tests {
         let failed = handle.call_tool("fails", "{}").await.unwrap_err();
         assert_eq!(
             failed.to_string(),
-            "Toolset error: ToolCallError: ToolCallError: ToolCallError: Connection refused"
+            "Toolset error: ToolCallError: ToolCallError: Connection refused"
         );
 
         let missing = handle.call_tool("missing", "{}").await.unwrap_err();
         assert_eq!(
             missing.to_string(),
-            "Toolset error: ToolCallError: ToolCallError: ToolNotFoundError: missing"
+            "Toolset error: ToolNotFoundError: missing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_keeps_its_error_type() {
+        let handle = ToolServer::new().tool(Fails).run();
+
+        let failed = handle.call_tool("fails", "{}").await.unwrap_err();
+        let ToolServerError::ToolsetError(ToolSetError::ToolCallError(ToolError::ToolCallError(
+            source,
+        ))) = &failed
+        else {
+            panic!("expected the tool's own error, got {failed:?}");
+        };
+        assert!(source.downcast_ref::<Refused>().is_some());
+
+        let missing = handle.call_tool("missing", "{}").await.unwrap_err();
+        assert!(matches!(
+            missing,
+            ToolServerError::ToolsetError(ToolSetError::ToolNotFoundError(ref name)) if name == "missing"
+        ));
     }
 
     #[tokio::test]
