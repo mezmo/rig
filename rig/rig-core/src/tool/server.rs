@@ -35,8 +35,17 @@ impl ToolServer {
     }
 
     pub(crate) fn static_tool_names(mut self, names: Vec<String>) -> Self {
-        self.static_tool_names = names;
+        self.static_tool_names.clear();
+        for name in names {
+            self.list_static(name);
+        }
         self
+    }
+
+    fn list_static(&mut self, name: String) {
+        if !self.static_tool_names.contains(&name) {
+            self.static_tool_names.push(name);
+        }
     }
 
     pub(crate) fn add_tools(mut self, tools: ToolSet) -> Self {
@@ -59,7 +68,7 @@ impl ToolServer {
     pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
         let toolname = tool.name();
         self.toolset.add_tool(tool);
-        self.static_tool_names.push(toolname);
+        self.list_static(toolname);
         self
     }
 
@@ -71,7 +80,7 @@ impl ToolServer {
         let toolname = tool.name.clone();
         self.toolset
             .add_tool(McpTool::from_mcp_server(tool, client));
-        self.static_tool_names.push(toolname.to_string());
+        self.list_static(toolname.to_string());
         self
     }
 
@@ -161,7 +170,7 @@ impl ToolServerHandle {
         let tool = ToolType::Simple(Arc::new(tool));
         let replaced = {
             let mut server = self.write();
-            server.static_tool_names.push(name.clone());
+            server.list_static(name.clone());
             server.toolset.tools.insert(name, tool)
         };
         drop(replaced);
@@ -681,6 +690,27 @@ mod tests {
             missing,
             ToolServerError::ToolsetError(ToolSetError::ToolNotFoundError(ref name)) if name == "missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn a_tool_added_again_is_listed_once() {
+        let mut toolset = ToolSet::default();
+        toolset.add_tool(Adder);
+        let handle = ToolServer::new()
+            .static_tool_names(vec!["add".into(), "add".into()])
+            .add_tools(toolset)
+            .tool(Adder)
+            .run();
+        handle.add_tool(Adder).await.unwrap();
+
+        let names: Vec<String> = handle
+            .get_tool_defs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(names, ["add"]);
     }
 
     #[tokio::test]
