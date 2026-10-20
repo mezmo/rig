@@ -34,6 +34,18 @@ const COLLECTION_NAME: &str = "words";
 const DATABASE_NAME: &str = "rig";
 const USERNAME: &str = "riguser";
 const PASSWORD: &str = "rigpassword";
+const MONGODB_IMAGE: &str = "mongodb/mongodb-atlas-local";
+const MONGODB_TAG: &str = "8.0.5";
+const EMBEDDING_DIMENSIONS: usize = 1536;
+const VECTOR_SEARCH_MAX_ATTEMPTS: usize = 30;
+
+/// A unit vector along `axis`. Distinct axes are orthogonal, so a query on
+/// one axis has exactly one closest document.
+fn axis_embedding(axis: usize) -> Vec<f64> {
+    let mut embedding = vec![0.0; EMBEDDING_DIMENSIONS];
+    embedding[axis] = 1.0;
+    embedding
+}
 
 #[tokio::test]
 async fn vector_search_test() {
@@ -59,17 +71,17 @@ async fn vector_search_test() {
                 "data": [
                   {
                     "object": "embedding",
-                    "embedding": vec![0.1; 1536],
+                    "embedding": axis_embedding(0),
                     "index": 0
                   },
                   {
                     "object": "embedding",
-                    "embedding": vec![0.2; 1536],
+                    "embedding": axis_embedding(1),
                     "index": 1
                   },
                   {
                     "object": "embedding",
-                    "embedding": vec![0.0023064255; 1536],
+                    "embedding": axis_embedding(2),
                     "index": 2
                   }
                 ],
@@ -98,7 +110,7 @@ async fn vector_search_test() {
                     "data": [
                       {
                         "object": "embedding",
-                        "embedding": vec![0.0023064254; 1536],
+                        "embedding": axis_embedding(2),
                         "index": 0
                       }
                     ],
@@ -122,7 +134,7 @@ async fn vector_search_test() {
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
 
     // Setup a local MongoDB Atlas container for testing. NOTE: docker service must be running.
-    let container = GenericImage::new("mongodb/mongodb-atlas-local", "latest")
+    let container = GenericImage::new(MONGODB_IMAGE, MONGODB_TAG)
         .with_exposed_port(MONGODB_PORT.tcp())
         .with_wait_for(WaitFor::Duration {
             length: std::time::Duration::from_secs(5),
@@ -141,9 +153,6 @@ async fn vector_search_test() {
     let embeddings = create_embeddings(model.clone()).await;
 
     collection.insert_many(embeddings).await.unwrap();
-
-    // Wait for the new documents to be indexed
-    sleep(Duration::from_secs(5)).await;
 
     // Create a vector index on our vector store.
     // Note: a vector index called "vector_index" must exist on the MongoDB collection you are querying.
@@ -164,7 +173,23 @@ async fn vector_search_test() {
         .build()
         .expect("VectorSearchRequest should not fail to build here");
 
-    let results = index.top_n::<serde_json::Value>(req).await.unwrap();
+    // The search index picks up new documents on its own time, so search
+    // until doc2 comes out on top.
+    let mut attempt = 0;
+    let results = loop {
+        attempt += 1;
+        let results = index.top_n::<serde_json::Value>(req.clone()).await;
+        if let Ok(results) = &results
+            && results.first().and_then(|(_, _, value)| value.get("_id")) == Some(&json!("doc2"))
+        {
+            break results.clone();
+        }
+        assert!(
+            attempt < VECTOR_SEARCH_MAX_ATTEMPTS,
+            "doc2 was never the top vector search result; last results: {results:?}"
+        );
+        sleep(Duration::from_secs(1)).await;
+    };
 
     let (score, _, value) = &results.first().unwrap();
 
@@ -228,7 +253,7 @@ async fn insert_documents_test() {
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
 
     // Setup MongoDB container
-    let container = GenericImage::new("mongodb/mongodb-atlas-local", "latest")
+    let container = GenericImage::new(MONGODB_IMAGE, MONGODB_TAG)
         .with_exposed_port(MONGODB_PORT.tcp())
         .with_wait_for(WaitFor::Duration {
             length: std::time::Duration::from_secs(5),
