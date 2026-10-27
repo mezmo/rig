@@ -12,8 +12,9 @@
 pub mod server;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
-use futures::Future;
+use futures::{Future, FutureExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -134,6 +135,8 @@ pub trait Tool: Sized + WasmCompatSend + WasmCompatSync {
     /// The tool execution method.
     /// Both the arguments and return value are a String since these values are meant to
     /// be the output and input of LLM models (respectively)
+    ///
+    /// Calls can run at the same time, including calls to the same tool.
     fn call(
         &self,
         args: Self::Args,
@@ -370,9 +373,10 @@ where
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ToolType {
-    Simple(Box<dyn ToolDyn>),
-    Embedding(Box<dyn ToolEmbeddingDyn>),
+    Simple(Arc<dyn ToolDyn>),
+    Embedding(Arc<dyn ToolEmbeddingDyn>),
 }
 
 impl ToolType {
@@ -418,7 +422,7 @@ pub enum ToolSetError {
 }
 
 /// A struct that holds a set of tools
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolSet {
     pub(crate) tools: HashMap<String, ToolType>,
 }
@@ -454,12 +458,13 @@ impl ToolSet {
     /// Add a tool to the toolset
     pub fn add_tool(&mut self, tool: impl ToolDyn + 'static) {
         self.tools
-            .insert(tool.name(), ToolType::Simple(Box::new(tool)));
+            .insert(tool.name(), ToolType::Simple(Arc::new(tool)));
     }
 
     /// Adds a boxed tool to the toolset. Useful for situations when dynamic dispatch is required.
     pub fn add_tool_boxed(&mut self, tool: Box<dyn ToolDyn>) {
-        self.tools.insert(tool.name(), ToolType::Simple(tool));
+        self.tools
+            .insert(tool.name(), ToolType::Simple(Arc::from(tool)));
     }
 
     pub fn delete_tool(&mut self, tool_name: &str) {
@@ -485,16 +490,11 @@ impl ToolSet {
     }
 
     /// Call a tool with the given name and arguments
+    ///
+    /// A panicking tool returns an `Err` with the panic's message. On wasm a
+    /// panic aborts instead.
     pub async fn call(&self, toolname: &str, args: String) -> Result<String, ToolSetError> {
-        if let Some(tool) = self.tools.get(toolname) {
-            tracing::debug!(target: "rig",
-                "Calling tool {toolname} with args:\n{}",
-                serde_json::to_string_pretty(&args).unwrap()
-            );
-            Ok(tool.call(args).await?)
-        } else {
-            Err(ToolSetError::ToolNotFoundError(toolname.to_string()))
-        }
+        call_tool_named(toolname, self.tools.get(toolname), args).await
     }
 
     /// Get the documents of all the tools in the toolset
@@ -554,6 +554,45 @@ impl ToolSet {
     }
 }
 
+pub(crate) async fn call_tool_named(
+    toolname: &str,
+    tool: Option<&ToolType>,
+    args: String,
+) -> Result<String, ToolSetError> {
+    let Some(tool) = tool else {
+        return Err(ToolSetError::ToolNotFoundError(toolname.to_string()));
+    };
+    tracing::debug!(target: "rig",
+        "Calling tool {toolname} with args:\n{}",
+        readable_args(&args)
+    );
+
+    // A panicking tool fails its own call. The caller carries on.
+    let result = std::panic::AssertUnwindSafe(tool.call(args))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| {
+            Err(ToolError::ToolCallError(
+                format!("tool `{toolname}` panicked: {}", panic_message(&panic)).into(),
+            ))
+        });
+    Ok(result?)
+}
+
+pub(crate) fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+fn readable_args(args: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(args)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| args.to_string())
+}
+
 #[derive(Default)]
 pub struct ToolSetBuilder {
     tools: Vec<ToolType>,
@@ -561,12 +600,12 @@ pub struct ToolSetBuilder {
 
 impl ToolSetBuilder {
     pub fn static_tool(mut self, tool: impl ToolDyn + 'static) -> Self {
-        self.tools.push(ToolType::Simple(Box::new(tool)));
+        self.tools.push(ToolType::Simple(Arc::new(tool)));
         self
     }
 
     pub fn dynamic_tool(mut self, tool: impl ToolEmbeddingDyn + 'static) -> Self {
-        self.tools.push(ToolType::Embedding(Box::new(tool)));
+        self.tools.push(ToolType::Embedding(Arc::new(tool)));
         self
     }
 
@@ -586,6 +625,49 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    struct Panics;
+
+    impl ToolDyn for Panics {
+        fn name(&self) -> String {
+            "panics".to_string()
+        }
+
+        fn definition<'a>(&'a self, _prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
+            Box::pin(async {
+                ToolDefinition {
+                    name: "panics".to_string(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                }
+            })
+        }
+
+        fn call<'a>(&'a self, _args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            Box::pin(async { panic!("tool blew up") })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_fails_its_call_through_the_tool_set() {
+        let toolset = ToolSet::from_tools(vec![Panics]);
+
+        let failed = toolset.call("panics", "{}".to_string()).await.unwrap_err();
+
+        assert_eq!(
+            failed.to_string(),
+            "ToolCallError: ToolCallError: tool `panics` panicked: tool blew up"
+        );
+    }
+
+    #[test]
+    fn logged_args_read_as_json() {
+        assert_eq!(
+            readable_args(r#"{"x":2,"y":5}"#),
+            "{\n  \"x\": 2,\n  \"y\": 5\n}"
+        );
+        assert_eq!(readable_args("not json"), "not json");
+    }
 
     fn get_test_toolset() -> ToolSet {
         let mut toolset = ToolSet::default();

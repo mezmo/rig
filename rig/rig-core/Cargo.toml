@@ -49,7 +49,6 @@ fastrand = "2.3.0"
 eventsource-stream = "0.2.3"
 pin-project-lite = "0.2.16"
 futures-timer = "3.0.3"
-wasm-bindgen-futures = { version = "0.4.54", optional = true }
 mime = "0.3.17"
 reqwest-middleware = { version = "0.4.2", optional = true, features = [
   "json",
@@ -61,7 +60,7 @@ reqwest-middleware = { version = "0.4.2", optional = true, features = [
 [dev-dependencies]
 anyhow = { workspace = true }
 assert_fs = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tokio-test = { workspace = true }
 redis = { version = "1.0.2", features = ["tokio-comp", "aio", "vector-sets"] }
@@ -100,7 +99,7 @@ discord-bot = ["dep:serenity"]
 pdf = ["dep:lopdf"]
 epub = ["dep:epub", "dep:quick-xml"]
 rayon = ["dep:rayon"]
-wasm = ["dep:wasm-bindgen-futures", "futures-timer/wasm-bindgen"]
+wasm = ["futures-timer/wasm-bindgen"]
 rmcp = ["dep:rmcp"]
 socks = ["reqwest/socks"]
 reqwest-tls = ["reqwest/default"]

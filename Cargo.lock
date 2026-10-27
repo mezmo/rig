@@ -9920,7 +9920,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
