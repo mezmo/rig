@@ -24,7 +24,7 @@ use crate::http_client::HttpClientExt;
 use crate::message::{self, MimeType, Reasoning};
 
 use crate::providers::gemini::completion::gemini_api_types::{
-    AdditionalParameters, FunctionCallingMode, ToolConfig,
+    AdditionalParameters, FunctionCallingMode, GenerationConfig, ToolConfig,
 };
 use crate::providers::gemini::streaming::StreamingCompletionResponse;
 use crate::telemetry::SpanCombinator;
@@ -197,6 +197,18 @@ pub(crate) fn create_request_body(
         mut generation_config,
         additional_params,
     } = serde_json::from_value::<AdditionalParameters>(additional_params)?;
+
+    // Built empty: `GenerationConfig::default()` sets a temperature and an
+    // output limit of its own, which would reach the request as if asked for.
+    if generation_config.is_none()
+        && (completion_request.temperature.is_some() || completion_request.max_tokens.is_some())
+    {
+        generation_config = Some(GenerationConfig {
+            temperature: None,
+            max_output_tokens: None,
+            ..Default::default()
+        });
+    }
 
     generation_config = generation_config.map(|mut cfg| {
         if let Some(temp) = completion_request.temperature {
@@ -1738,6 +1750,62 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    /// The `generationConfig` a request with these settings sends.
+    fn sent_generation_config(
+        temperature: Option<f64>,
+        max_tokens: Option<u64>,
+        additional_params: Option<Value>,
+    ) -> Option<Value> {
+        let request = create_request_body(CompletionRequest {
+            preamble: None,
+            chat_history: OneOrMany::one(message::Message::user("hi")),
+            documents: vec![],
+            tools: vec![],
+            temperature,
+            max_tokens,
+            tool_choice: None,
+            additional_params,
+        })
+        .unwrap();
+        serde_json::to_value(request)
+            .unwrap()
+            .get("generationConfig")
+            .filter(|config| !config.is_null())
+            .cloned()
+    }
+
+    #[test]
+    fn temperature_and_max_tokens_are_sent_without_additional_params() {
+        assert_eq!(
+            sent_generation_config(Some(0.2), None, None),
+            Some(json!({"temperature": 0.2}))
+        );
+        assert_eq!(
+            sent_generation_config(None, Some(1024), None),
+            Some(json!({"maxOutputTokens": 1024}))
+        );
+        assert_eq!(
+            sent_generation_config(Some(0.2), Some(1024), None),
+            Some(json!({"temperature": 0.2, "maxOutputTokens": 1024}))
+        );
+    }
+
+    #[test]
+    fn no_generation_config_is_sent_when_nothing_sets_one() {
+        assert_eq!(sent_generation_config(None, None, None), None);
+    }
+
+    #[test]
+    fn a_configured_generation_config_keeps_its_fields_under_the_request_settings() {
+        let additional_params = json!({
+            "generationConfig": {"topK": 5, "temperature": 0.9, "maxOutputTokens": 10}
+        });
+        assert_eq!(
+            sent_generation_config(Some(0.2), Some(1024), Some(additional_params)),
+            Some(json!({"topK": 5, "temperature": 0.2, "maxOutputTokens": 1024}))
+        );
+    }
 
     #[test]
     fn test_deserialize_message_user() {
