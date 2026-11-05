@@ -124,6 +124,11 @@ struct ThinkingState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamingCompletionResponse {
     pub usage: PartialUsage,
+    /// Why Anthropic ended the message (`end_turn`, `tool_use`, `max_tokens`,
+    /// `stop_sequence`, ...), from its `message_delta`. `None` when the stream
+    /// ended without one, e.g. on a transport error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
@@ -271,6 +276,7 @@ where
             let mut cache_read_input_tokens = None;
             let mut cache_creation_input_tokens = None;
             let mut final_usage = None;
+            let mut stop_reason = None;
 
             let mut text_content = String::new();
 
@@ -305,6 +311,17 @@ where
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&usage);
                                             final_usage = Some(usage);
+                                            stop_reason = delta.stop_reason.clone();
+
+                                            // A tool_use block the message stopped inside never
+                                            // gets its content_block_stop, so its arguments are
+                                            // incomplete and the call cannot be delivered. Say so
+                                            // rather than ending as if the turn were empty.
+                                            if current_tool_call.take().is_some() {
+                                                yield Err(unfinished_tool_call_error(
+                                                    delta.stop_reason.as_deref().unwrap_or_default(),
+                                                ));
+                                            }
                                             break;
                                         }
                                     }
@@ -338,12 +355,29 @@ where
             sse_stream.close();
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage: final_usage.unwrap_or_default()
+                usage: final_usage.unwrap_or_default(),
+                stop_reason,
             }))
         }.instrument(span));
 
         Ok(streaming::StreamingCompletionResponse::stream(stream))
     }
+}
+
+/// The error for a tool call whose message stopped before its content block
+/// closed. Leaves out the tool name and call id: this crate and its callers
+/// classify provider errors by substring, so a name such as `list_aborted_jobs`
+/// would read as a cancellation and an id containing `503` as an outage.
+fn unfinished_tool_call_error(stop_reason: &str) -> CompletionError {
+    let hint = if stop_reason == "max_tokens" {
+        " Raise max_tokens or ask for a smaller tool input."
+    } else {
+        ""
+    };
+    CompletionError::ProviderError(format!(
+        "Anthropic stopped the message ({stop_reason}) while streaming the arguments of a tool \
+         call; the incomplete call was dropped.{hint}"
+    ))
 }
 
 fn handle_event(
@@ -792,5 +826,243 @@ mod tests {
 
         assert_eq!(usage.token_usage().unwrap().input_tokens, 100);
         assert!(usage.cache_token_usage().is_none());
+    }
+    /// Replays recorded SSE bytes as the response to every streaming request.
+    #[derive(Clone, Default)]
+    struct MockHttpClient {
+        sse_bytes: bytes::Bytes,
+    }
+
+    impl crate::http_client::HttpClientExt for MockHttpClient {
+        fn send<T, U>(
+            &self,
+            _req: http::Request<T>,
+        ) -> impl std::future::Future<
+            Output = crate::http_client::Result<http::Response<crate::http_client::LazyBody<U>>>,
+        > + crate::wasm_compat::WasmCompatSend
+        + 'static
+        where
+            T: Into<bytes::Bytes>,
+            T: crate::wasm_compat::WasmCompatSend,
+            U: From<bytes::Bytes>,
+            U: crate::wasm_compat::WasmCompatSend + 'static,
+        {
+            std::future::ready(Err(crate::http_client::Error::InvalidStatusCode(
+                http::StatusCode::NOT_IMPLEMENTED,
+            )))
+        }
+
+        fn send_multipart<U>(
+            &self,
+            _req: http::Request<crate::http_client::MultipartForm>,
+        ) -> impl std::future::Future<
+            Output = crate::http_client::Result<http::Response<crate::http_client::LazyBody<U>>>,
+        > + crate::wasm_compat::WasmCompatSend
+        + 'static
+        where
+            U: From<bytes::Bytes>,
+            U: crate::wasm_compat::WasmCompatSend + 'static,
+        {
+            std::future::ready(Err(crate::http_client::Error::InvalidStatusCode(
+                http::StatusCode::NOT_IMPLEMENTED,
+            )))
+        }
+
+        fn send_streaming<T>(
+            &self,
+            _req: http::Request<T>,
+        ) -> impl std::future::Future<
+            Output = crate::http_client::Result<crate::http_client::StreamingResponse>,
+        > + crate::wasm_compat::WasmCompatSend
+        where
+            T: Into<bytes::Bytes>,
+        {
+            let sse_bytes = self.sse_bytes.clone();
+            async move {
+                let byte_stream = futures::stream::iter(vec![Ok::<
+                    bytes::Bytes,
+                    crate::http_client::Error,
+                >(sse_bytes)]);
+                let boxed_stream: crate::http_client::sse::BoxedStream = Box::pin(byte_stream);
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                    .body(boxed_stream)
+                    .map_err(crate::http_client::Error::Protocol)
+            }
+        }
+    }
+
+    /// Streams one completion whose response is `events` (one SSE `data:`
+    /// line each) and collects everything the stream yields.
+    async fn stream_events(
+        events: &[&str],
+    ) -> Vec<
+        Result<streaming::StreamedAssistantContent<StreamingCompletionResponse>, CompletionError>,
+    > {
+        use crate::client::CompletionClient;
+
+        let sse: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let client = super::super::Client::<MockHttpClient>::builder()
+            .api_key("test-key")
+            .http_client(MockHttpClient {
+                sse_bytes: bytes::Bytes::from(sse),
+            })
+            .build()
+            .expect("client builds");
+        let model = client.completion_model("claude-test");
+        let request = CompletionRequest {
+            preamble: None,
+            chat_history: crate::OneOrMany::one(crate::completion::Message::user("go")),
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(64),
+            tool_choice: None,
+            additional_params: None,
+        };
+        let mut stream = model.stream(request).await.expect("stream opens");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        items
+    }
+
+    const MESSAGE_START: &str = r#"{"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":1}}}"#;
+    const TOOL_USE_START: &str = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"respond_directly","input":{}}}"#;
+    const PARTIAL_ARGS: &str = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"answer\": \"the runbooks are"}}"#;
+
+    fn message_delta(stop_reason: &str) -> String {
+        format!(
+            r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}","stop_sequence":null}},"usage":{{"output_tokens":64}}}}"#
+        )
+    }
+
+    fn final_response(
+        items: &[Result<
+            streaming::StreamedAssistantContent<StreamingCompletionResponse>,
+            CompletionError,
+        >],
+    ) -> &StreamingCompletionResponse {
+        items
+            .iter()
+            .find_map(|item| match item {
+                Ok(streaming::StreamedAssistantContent::Final(response)) => Some(response),
+                _ => None,
+            })
+            .expect("the stream ends with a final response")
+    }
+
+    /// mezmo/aura#591: a message cut off by max_tokens inside a tool_use block
+    /// gets no content_block_stop for it. The incomplete call must surface as
+    /// an error, not vanish into an empty turn.
+    #[tokio::test]
+    async fn a_tool_call_cut_off_by_max_tokens_is_an_error() {
+        let stop = message_delta("max_tokens");
+        let items = stream_events(&[
+            MESSAGE_START,
+            TOOL_USE_START,
+            PARTIAL_ARGS,
+            &stop,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        let errors: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_ref().err().map(|e| e.to_string()))
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("max_tokens"), "{}", errors[0]);
+        assert!(
+            !errors[0].contains("toolu_01") && !errors[0].contains("respond_directly"),
+            "the call id and tool name stay out of the message: {}",
+            errors[0]
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(streaming::StreamedAssistantContent::ToolCall(_)))),
+            "the incomplete call must not be delivered"
+        );
+        assert_eq!(
+            final_response(&items).stop_reason.as_deref(),
+            Some("max_tokens")
+        );
+    }
+
+    /// The stream treats a provider error containing `aborted` as a cancellation
+    /// and ends quietly, so a tool name with that word must not hide the error.
+    #[tokio::test]
+    async fn a_cut_off_tool_call_named_aborted_still_reports_the_error() {
+        let stop = message_delta("max_tokens");
+        let tool_use_start = TOOL_USE_START.replace("respond_directly", "list_aborted_jobs");
+        let items = stream_events(&[
+            MESSAGE_START,
+            &tool_use_start,
+            PARTIAL_ARGS,
+            &stop,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        let errors = items.iter().filter(|item| item.is_err()).count();
+        assert_eq!(errors, 1, "the error must reach the caller: {items:?}");
+        assert_eq!(
+            final_response(&items).stop_reason.as_deref(),
+            Some("max_tokens")
+        );
+    }
+
+    /// A text answer cut off by max_tokens is still delivered, and the final
+    /// response says why it ended, so a caller can tell truncated from done.
+    #[tokio::test]
+    async fn a_text_answer_cut_off_by_max_tokens_reports_its_stop_reason() {
+        let stop = message_delta("max_tokens");
+        let items = stream_events(&[
+            MESSAGE_START,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The first runbook"}}"#,
+            &stop,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        assert!(items.iter().all(|item| item.is_ok()), "no error for text");
+        assert_eq!(
+            final_response(&items).stop_reason.as_deref(),
+            Some("max_tokens")
+        );
+    }
+
+    /// A tool call whose block closes before the message stops is delivered
+    /// as before, with `tool_use` as the stop reason.
+    #[tokio::test]
+    async fn a_completed_tool_call_is_delivered_with_its_stop_reason() {
+        let stop = message_delta("tool_use");
+        let items = stream_events(&[
+            MESSAGE_START,
+            TOOL_USE_START,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"answer\": \"done\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            &stop,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        assert!(items.iter().all(|item| item.is_ok()), "{items:?}");
+        assert!(items.iter().any(|item| matches!(
+            item,
+            Ok(streaming::StreamedAssistantContent::ToolCall(call))
+                if call.function.name == "respond_directly"
+        )));
+        assert_eq!(
+            final_response(&items).stop_reason.as_deref(),
+            Some("tool_use")
+        );
     }
 }
